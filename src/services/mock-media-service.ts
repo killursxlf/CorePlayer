@@ -1,0 +1,109 @@
+import type { ExportProgressHandler, MediaService } from "@/services/media-service"
+import type { ExportTrimRequest } from "@/types/export"
+import type {
+  AudioWaveformRequest,
+  AudioWaveformResult,
+  MediaProbe,
+  OpenMediaResult,
+  ThumbnailRequest,
+  ThumbnailResult,
+  TimelineThumbnail,
+} from "@/types/media"
+
+const mockProbe: MediaProbe = {
+  duration: 214,
+  codec: "H.264 / AVC",
+  resolution: "1920 x 1080",
+  fps: 30,
+  bitrate: "24 Mbps",
+  audioStreams: "1 - Stereo AAC",
+  subtitles: "None",
+}
+
+function fileNameFromPath(path: string) {
+  return path.split(/[\\/]/).pop() || path
+}
+
+export const mockMediaService: MediaService = {
+  async openMedia(): Promise<OpenMediaResult | null> {
+    const originalPath = "C:\\Videos\\summit_ascent_final.mp4"
+    return {
+      originalPath,
+      playbackUrl: "/images/preview-frame.png",
+      fileName: fileNameFromPath(originalPath),
+      probe: mockProbe,
+    }
+  },
+
+  async closeMedia(): Promise<void> {
+    return undefined
+  },
+
+  async probeMedia(): Promise<MediaProbe> {
+    return mockProbe
+  },
+
+  async preparePlayback(): Promise<string> {
+    return "/images/preview-frame.png"
+  },
+
+  async createVideoCacheId(): Promise<string> {
+    return "mock-video"
+  },
+
+  async generateTimelineThumbnails(): Promise<TimelineThumbnail[]> {
+    return Array.from({ length: 18 }, (_, index) => ({
+      time: index * 12,
+      url: "/images/preview-frame.png",
+    }))
+  },
+
+  async generateTimelineThumbnailRange(request: ThumbnailRequest): Promise<ThumbnailResult> {
+    const thumbnails = []
+    for (let time = request.startTime; time <= request.endTime; time += request.intervalSeconds) {
+      thumbnails.push({
+        time: Math.round(time * 1000) / 1000,
+        path: "/images/preview-frame.png",
+        state: "ready" as const,
+      })
+    }
+
+    return {
+      videoId: request.videoId,
+      generation: request.generation,
+      intervalSeconds: request.intervalSeconds,
+      cacheDir: "mock://thumbnail-cache",
+      thumbnails,
+    }
+  },
+
+  async generateAudioWaveform(request: AudioWaveformRequest): Promise<AudioWaveformResult> {
+    return {
+      videoId: request.videoId,
+      duration: request.duration,
+      peaks: Array.from({ length: request.peakCount }, (_, index) => {
+        const time = index / Math.max(1, request.peakCount - 1)
+        return Math.min(1, 0.15 + Math.abs(Math.sin(time * 34)) * 0.55 + Math.abs(Math.cos(time * 93)) * 0.3)
+      }),
+    }
+  },
+
+  async exportTrim(
+    request: ExportTrimRequest,
+    onProgress?: ExportProgressHandler,
+  ): Promise<{ operationId: string; outputPath: string }> {
+    const operationId = crypto.randomUUID()
+    onProgress?.({
+      operationId,
+      progress: 1,
+      message: request.annotations?.length
+        ? `Mock export completed with ${request.annotations.length} overlay annotations`
+        : "Mock export completed",
+    })
+    return { operationId, outputPath: request.outputPath || `mock-export.${request.settings.format}` }
+  },
+
+  async cancelOperation(): Promise<void> {
+    return undefined
+  },
+}

@@ -1,18 +1,18 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
-  "productName": "video-editor",
+  "productName": "CorePlayer",
   "version": "0.1.0",
-  "identifier": "com.tauri.dev",
+  "identifier": "com.excge.coreplayer",
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:5173",
-    "beforeDevCommand": "bun dev",
-    "beforeBuildCommand": "bun build"
+    "beforeDevCommand": "bun run dev",
+    "beforeBuildCommand": "bun run build"
   },
   "app": {
     "windows": [
       {
-        "title": "video-editor",
+        "title": "CorePlayer",
         "width": 800,
         "height": 600,
         "resizable": true,

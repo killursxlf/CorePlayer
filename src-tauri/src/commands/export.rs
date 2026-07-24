@@ -2,7 +2,7 @@ use tauri::{AppHandle, State};
 
 use crate::media::{
     errors::AppError,
-    ffmpeg::FfmpegBackend,
+    ffmpeg::{BackgroundMediaBackend, FfmpegBackend},
     models::{ExportStarted, ExportTrimRequest},
 };
 
@@ -10,9 +10,14 @@ use crate::media::{
 pub fn export_trim(
     app: AppHandle,
     backend: State<'_, FfmpegBackend>,
+    resources: State<'_, BackgroundMediaBackend>,
     request: ExportTrimRequest,
 ) -> Result<ExportStarted, AppError> {
-    backend.export_trim(app, request).map_err(AppError::from)
+    resources.set_exporting(true);
+    backend
+        .export_trim(app, request, resources.inner().clone())
+        .inspect_err(|_| resources.set_exporting(false))
+        .map_err(AppError::from)
 }
 
 #[tauri::command]

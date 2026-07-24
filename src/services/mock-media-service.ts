@@ -7,8 +7,52 @@ import type {
   OpenMediaResult,
   ThumbnailRequest,
   ThumbnailResult,
-  TimelineThumbnail,
+  HardwareProfile,
+  PerformancePreset,
+  RuntimeMetrics,
+  RuntimePerformanceConfig,
+  TaskBudget,
 } from "@/types/media"
+
+const mockBudget: TaskBudget = {
+  allowed: true,
+  cpuThreads: 1,
+  filterThreads: 1,
+  maxParallelJobs: 1,
+  batchSize: 3,
+  maxChunkSeconds: 12,
+  prefetchAllowed: true,
+  delayMs: 20,
+  ramCacheBytes: 128 * 1024 * 1024,
+  decodeConcurrency: 2,
+  cancelLowPriority: false,
+  reason: "mock",
+}
+
+const mockHardware: HardwareProfile = {
+  logicalCpus: 4,
+  powerClass: "medium",
+  operatingSystem: "mock",
+  storageClass: "conservative-unknown",
+  hardwareDecodeAvailable: false,
+}
+
+let mockPreset: PerformancePreset = "auto"
+
+function mockRuntimeConfig(droppedFrameRatio = 0): RuntimePerformanceConfig {
+  return {
+    hardware: mockHardware,
+    preset: mockPreset,
+    pressure: droppedFrameRatio > 0.03 ? "high" : "normal",
+    playbackActive: false,
+    exportActive: false,
+    droppedFrameRatio,
+    cpuLoad: 0,
+    activeBackgroundTasks: 0,
+    thumbnailBudget: mockBudget,
+    waveformBudget: mockBudget,
+  }
+}
 
 const mockProbe: MediaProbe = {
   duration: 214,
@@ -51,13 +95,6 @@ export const mockMediaService: MediaService = {
     return "mock-video"
   },
 
-  async generateTimelineThumbnails(): Promise<TimelineThumbnail[]> {
-    return Array.from({ length: 18 }, (_, index) => ({
-      time: index * 12,
-      url: "/images/preview-frame.png",
-    }))
-  },
-
   async generateTimelineThumbnailRange(request: ThumbnailRequest): Promise<ThumbnailResult> {
     const thumbnails = []
     for (let time = request.startTime; time <= request.endTime; time += request.intervalSeconds) {
@@ -80,12 +117,41 @@ export const mockMediaService: MediaService = {
   async generateAudioWaveform(request: AudioWaveformRequest): Promise<AudioWaveformResult> {
     return {
       videoId: request.videoId,
-      duration: request.duration,
+      startTime: request.startTime,
+      endTime: request.endTime,
       peaks: Array.from({ length: request.peakCount }, (_, index) => {
         const time = index / Math.max(1, request.peakCount - 1)
         return Math.min(1, 0.15 + Math.abs(Math.sin(time * 34)) * 0.55 + Math.abs(Math.cos(time * 93)) * 0.3)
       }),
     }
+  },
+
+  async cancelBackgroundMedia(): Promise<void> {
+    return undefined
+  },
+
+  async setMediaPlaybackState(): Promise<void> {
+    return undefined
+  },
+
+  async getHardwareProfile(): Promise<HardwareProfile> {
+    return mockHardware
+  },
+
+  async getRuntimePerformanceConfig(): Promise<RuntimePerformanceConfig> {
+    return mockRuntimeConfig()
+  },
+
+  async setPerformancePreset(preset: PerformancePreset): Promise<void> {
+    mockPreset = preset
+  },
+
+  async updateRuntimeMetrics(metrics: RuntimeMetrics): Promise<RuntimePerformanceConfig> {
+    return mockRuntimeConfig(metrics.droppedFrameRatio)
+  },
+
+  async getMediaTaskBudget(): Promise<TaskBudget> {
+    return mockBudget
   },
 
   async exportTrim(

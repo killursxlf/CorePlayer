@@ -7,7 +7,12 @@ import type {
   OpenMediaResult,
   ThumbnailRequest,
   ThumbnailResult,
-  TimelineThumbnail,
+  HardwareProfile,
+  MediaTaskKind,
+  PerformancePreset,
+  RuntimeMetrics,
+  RuntimePerformanceConfig,
+  TaskBudget,
 } from "@/types/media"
 
 export type MediaServiceResult<T> = Promise<T>
@@ -20,12 +25,15 @@ export type MediaService = {
   probeMedia: (inputPath: string) => MediaServiceResult<MediaProbe>
   preparePlayback: (inputPath: string) => MediaServiceResult<string>
   createVideoCacheId: (inputPath: string) => MediaServiceResult<string>
-  generateTimelineThumbnails: (
-    inputPath: string,
-    duration: number,
-  ) => MediaServiceResult<TimelineThumbnail[]>
   generateTimelineThumbnailRange: (request: ThumbnailRequest) => MediaServiceResult<ThumbnailResult>
   generateAudioWaveform: (request: AudioWaveformRequest) => MediaServiceResult<AudioWaveformResult>
+  cancelBackgroundMedia: () => MediaServiceResult<void>
+  setMediaPlaybackState: (playing: boolean) => MediaServiceResult<void>
+  getHardwareProfile: () => MediaServiceResult<HardwareProfile>
+  getRuntimePerformanceConfig: () => MediaServiceResult<RuntimePerformanceConfig>
+  setPerformancePreset: (preset: PerformancePreset) => MediaServiceResult<void>
+  updateRuntimeMetrics: (metrics: RuntimeMetrics) => MediaServiceResult<RuntimePerformanceConfig>
+  getMediaTaskBudget: (kind: MediaTaskKind) => MediaServiceResult<TaskBudget>
   exportTrim: (
     request: ExportTrimRequest,
     onProgress?: ExportProgressHandler,

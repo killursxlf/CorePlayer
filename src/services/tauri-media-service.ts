@@ -10,7 +10,13 @@ import type {
   OpenMediaResult,
   ThumbnailRequest,
   ThumbnailResult,
-  TimelineThumbnail,
+  HardwareProfile,
+  MediaTaskKind,
+  PerformancePreset,
+  RuntimeMetrics,
+  RuntimePerformanceConfig,
+  TaskBudget,
+  PlaybackRegistration,
 } from "@/types/media"
 
 const videoExtensions = ["mp4", "mov", "mkv", "webm", "avi", "m4v"]
@@ -23,15 +29,6 @@ const exportExtensions = {
 
 function fileNameFromPath(path: string) {
   return path.split(/[\\/]/).pop() || path
-}
-
-function preparePlaybackUrl(inputPath: string) {
-  return convertFileSrc(inputPath)
-}
-
-type TimelineThumbnailResponse = {
-  time: number
-  path: string
 }
 
 export const tauriMediaService: MediaService = {
@@ -47,14 +44,16 @@ export const tauriMediaService: MediaService = {
 
     return {
       originalPath: selected,
-      playbackUrl: preparePlaybackUrl(selected),
+      playbackUrl: await tauriMediaService.preparePlayback(selected),
       fileName: fileNameFromPath(selected),
       probe: await tauriMediaService.probeMedia(selected),
     }
   },
 
-  async closeMedia(): Promise<void> {
-    return undefined
+  async closeMedia(playbackUrl: string | null): Promise<void> {
+    if (playbackUrl?.startsWith("http://127.0.0.1:")) {
+      await invoke("unregister_playback_media", { playbackUrl })
+    }
   },
 
   async probeMedia(inputPath: string): Promise<MediaProbe> {
@@ -62,27 +61,12 @@ export const tauriMediaService: MediaService = {
   },
 
   async preparePlayback(inputPath: string): Promise<string> {
-    return preparePlaybackUrl(inputPath)
+    const registration = await invoke<PlaybackRegistration>("register_playback_media", { inputPath })
+    return registration.streamUrl
   },
 
   async createVideoCacheId(inputPath: string): Promise<string> {
     return invoke<string>("create_video_cache_id", { inputPath })
-  },
-
-  async generateTimelineThumbnails(
-    inputPath: string,
-    duration: number,
-  ): Promise<TimelineThumbnail[]> {
-    const thumbnails = await invoke<TimelineThumbnailResponse[]>("generate_timeline_thumbnails", {
-      inputPath,
-      duration,
-      maxFrames: 72,
-    })
-
-    return thumbnails.map((thumbnail) => ({
-      time: thumbnail.time,
-      url: convertFileSrc(thumbnail.path),
-    }))
   },
 
   async generateTimelineThumbnailRange(request: ThumbnailRequest): Promise<ThumbnailResult> {
@@ -98,6 +82,34 @@ export const tauriMediaService: MediaService = {
 
   async generateAudioWaveform(request: AudioWaveformRequest): Promise<AudioWaveformResult> {
     return invoke<AudioWaveformResult>("generate_audio_waveform", { request })
+  },
+
+  async cancelBackgroundMedia(): Promise<void> {
+    await invoke("cancel_background_media")
+  },
+
+  async setMediaPlaybackState(playing: boolean): Promise<void> {
+    await invoke("set_media_playback_state", { playing })
+  },
+
+  async getHardwareProfile(): Promise<HardwareProfile> {
+    return invoke<HardwareProfile>("get_hardware_profile")
+  },
+
+  async getRuntimePerformanceConfig(): Promise<RuntimePerformanceConfig> {
+    return invoke<RuntimePerformanceConfig>("get_runtime_performance_config")
+  },
+
+  async setPerformancePreset(preset: PerformancePreset): Promise<void> {
+    await invoke("set_performance_preset", { preset })
+  },
+
+  async updateRuntimeMetrics(metrics: RuntimeMetrics): Promise<RuntimePerformanceConfig> {
+    return invoke<RuntimePerformanceConfig>("update_runtime_metrics", { metrics })
+  },
+
+  async getMediaTaskBudget(kind: MediaTaskKind): Promise<TaskBudget> {
+    return invoke<TaskBudget>("get_media_task_budget", { kind })
   },
 
   async exportTrim(

@@ -1,4 +1,11 @@
-use std::{fs, path::Path, process::Command};
+use std::{
+    fs::{self, File},
+    io::Read,
+    path::Path,
+    process::{Command, Output, Stdio},
+    thread,
+    time::{Duration, Instant},
+};
 
 use serde_json::Value;
 
@@ -19,17 +26,21 @@ pub fn probe_media(input_path: &str) -> Result<MediaProbe, MediaError> {
         return Ok(probe_media_fallback(input_path));
     };
 
-    let output = Command::new(ffprobe)
+    let mut command = Command::new(ffprobe);
+    command
         .arg("-v")
         .arg("error")
+        .arg("-probesize")
+        .arg("5000000")
+        .arg("-analyzeduration")
+        .arg("2000000")
         .arg("-print_format")
         .arg("json")
         .arg("-show_format")
         .arg("-show_streams")
-        .arg(input_path)
-        .output();
+        .arg(input_path);
 
-    let output = match output {
+    let output = match run_probe_with_timeout(&mut command, Duration::from_secs(10)) {
         Ok(output) if output.status.success() => output,
         _ => return Ok(probe_media_fallback(input_path)),
     };
@@ -153,31 +164,55 @@ pub fn probe_media(input_path: &str) -> Result<MediaProbe, MediaError> {
         }),
     };
 
-    let fallback = probe_media_fallback(input_path);
-    if probe.codec.is_none() {
-        probe.codec = fallback.codec;
-    }
-    if probe.resolution.is_none() {
-        probe.resolution = fallback.resolution;
-    }
-    if probe.fps.is_none() {
-        probe.fps = fallback.fps;
-    }
-    if probe.duration <= 0.0 {
-        probe.duration = fallback.duration;
-    }
-    if probe.bitrate.is_none() {
-        probe.bitrate = fallback.bitrate;
+    let needs_fallback = probe.codec.is_none()
+        || probe.resolution.is_none()
+        || probe.fps.is_none()
+        || probe.duration <= 0.0
+        || probe.bitrate.is_none();
+    if needs_fallback {
+        let fallback = probe_media_fallback(input_path);
+        if probe.codec.is_none() {
+            probe.codec = fallback.codec;
+        }
+        if probe.resolution.is_none() {
+            probe.resolution = fallback.resolution;
+        }
+        if probe.fps.is_none() {
+            probe.fps = fallback.fps;
+        }
+        if probe.duration <= 0.0 {
+            probe.duration = fallback.duration;
+        }
+        if probe.bitrate.is_none() {
+            probe.bitrate = fallback.bitrate;
+        }
     }
 
     Ok(probe)
 }
 
+fn run_probe_with_timeout(command: &mut Command, timeout: Duration) -> std::io::Result<Output> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    let started = Instant::now();
+    loop {
+        if child.try_wait()?.is_some() {
+            return child.wait_with_output();
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            return child.wait_with_output();
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
 fn probe_media_fallback(input_path: &str) -> MediaProbe {
     let path = Path::new(input_path);
-    let data = fs::read(path)
-        .map(|bytes| bytes.into_iter().take(8 * 1024 * 1024).collect::<Vec<_>>())
-        .unwrap_or_default();
+    let mut data = Vec::with_capacity(8 * 1024 * 1024);
+    if let Ok(file) = File::open(path) {
+        let _ = file.take(8 * 1024 * 1024).read_to_end(&mut data);
+    }
     let file_size = fs::metadata(path)
         .map(|metadata| metadata.len())
         .unwrap_or(0);

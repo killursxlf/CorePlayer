@@ -150,19 +150,13 @@ pub struct MediaProbe {
     pub subtitles: Option<String>,
 }
 
-#[derive(Debug, Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct TimelineThumbnail {
-    pub time: f64,
-    pub path: String,
-}
-
 #[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct AudioWaveformRequest {
     pub video_id: String,
     pub file_path: String,
-    pub duration: f64,
+    pub start_time: f64,
+    pub end_time: f64,
     pub peak_count: usize,
 }
 
@@ -170,7 +164,8 @@ pub struct AudioWaveformRequest {
 #[serde(rename_all = "camelCase")]
 pub struct AudioWaveformResult {
     pub video_id: String,
-    pub duration: f64,
+    pub start_time: f64,
+    pub end_time: f64,
     pub peaks: Vec<f32>,
 }
 
@@ -183,7 +178,17 @@ pub struct ThumbnailRequest {
     pub end_time: f64,
     pub interval_seconds: f64,
     pub thumbnail_width: u32,
+    pub thumbnail_height: u32,
     pub generation: u64,
+    pub priority: ThumbnailPriority,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy)]
+#[serde(rename_all = "camelCase")]
+pub enum ThumbnailPriority {
+    Visible,
+    Near,
+    Prefetch,
 }
 
 #[allow(dead_code)]

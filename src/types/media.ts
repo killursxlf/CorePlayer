@@ -19,21 +19,25 @@ export type OpenMediaResult = {
   probe: MediaProbe
 }
 
-export type TimelineThumbnail = {
-  time: number
-  url: string
+export type PlaybackRegistration = {
+  mediaId: string
+  streamUrl: string
+  fileSize: number
+  mimeType: string
 }
 
 export type AudioWaveformRequest = {
   videoId: string
   filePath: string
-  duration: number
+  startTime: number
+  endTime: number
   peakCount: number
 }
 
 export type AudioWaveformResult = {
   videoId: string
-  duration: number
+  startTime: number
+  endTime: number
   peaks: number[]
 }
 
@@ -46,7 +50,9 @@ export type ThumbnailRequest = {
   endTime: number
   intervalSeconds: number
   thumbnailWidth: number
+  thumbnailHeight: number
   generation: number
+  priority: "visible" | "near" | "prefetch"
 }
 
 export type ThumbnailResult = {
@@ -85,3 +91,59 @@ export type MediaState = {
 }
 
 export type ExportStatus = "idle" | "preparing" | "exporting" | "completed" | "failed" | "cancelled"
+
+export type PerformancePreset = "auto" | "powerSaver" | "balanced" | "performance" | "custom"
+export type PressureLevel = "normal" | "elevated" | "high" | "critical"
+export type MediaTaskKind =
+  | "visibleThumbnail"
+  | "nearThumbnail"
+  | "thumbnailPrefetch"
+  | "visibleWaveform"
+  | "fullWaveform"
+  | "proxy"
+  | "export"
+
+export type HardwareProfile = {
+  logicalCpus: number
+  powerClass: string
+  operatingSystem: string
+  storageClass: string
+  totalRamBytes?: number
+  availableRamBytes?: number
+  onBattery?: boolean
+  hardwareDecodeAvailable: boolean
+}
+
+export type TaskBudget = {
+  allowed: boolean
+  cpuThreads: number
+  filterThreads: number
+  maxParallelJobs: number
+  batchSize: number
+  maxChunkSeconds: number
+  prefetchAllowed: boolean
+  delayMs: number
+  ramCacheBytes: number
+  decodeConcurrency: number
+  cancelLowPriority: boolean
+  reason: string
+}
+
+export type RuntimePerformanceConfig = {
+  hardware: HardwareProfile
+  preset: PerformancePreset
+  pressure: PressureLevel
+  playbackActive: boolean
+  exportActive: boolean
+  droppedFrameRatio: number
+  cpuLoad?: number
+  activeBackgroundTasks: number
+  thumbnailBudget: TaskBudget
+  waveformBudget: TaskBudget
+}
+
+export type RuntimeMetrics = {
+  droppedFrameRatio: number
+  userActive: boolean
+  windowVisible: boolean
+}

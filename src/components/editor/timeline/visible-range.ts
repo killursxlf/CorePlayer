@@ -3,6 +3,10 @@ export type VisibleRange = {
   visibleEnd: number
   requestStart: number
   requestEnd: number
+  nearStart: number
+  nearEnd: number
+  prefetchStart: number
+  prefetchEnd: number
   scrollLeft: number
   viewportWidth: number
 }
@@ -26,6 +30,10 @@ export function calculateVisibleRange(params: {
     visibleEnd,
     requestStart: Math.max(0, visibleStart - viewportSeconds),
     requestEnd: Math.min(params.duration, visibleEnd + viewportSeconds),
+    nearStart: Math.max(0, visibleStart - viewportSeconds * 0.5),
+    nearEnd: Math.min(params.duration, visibleEnd + viewportSeconds * 0.5),
+    prefetchStart: Math.max(0, visibleStart - viewportSeconds * 1.5),
+    prefetchEnd: Math.min(params.duration, visibleEnd + viewportSeconds * 1.5),
     scrollLeft: params.scrollLeft,
     viewportWidth: params.viewportWidth,
   }

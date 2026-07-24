@@ -23,6 +23,7 @@ export class ThumbnailJobQueue {
   private readonly onUpdate: (status: TimelineThumbnailStatus) => void
   private readonly maxParallel: number
   private activeCount = 0
+  private decodeConcurrency = 2
 
   constructor(
     service: MediaService,
@@ -39,6 +40,10 @@ export class ThumbnailJobQueue {
   generation = 0
   cacheDir: string | null = null
   readonly states = new Map<string, ThumbnailState>()
+
+  setDecodeConcurrency(value: number) {
+    this.decodeConcurrency = Math.max(1, Math.min(3, Math.floor(value)))
+  }
 
   request(request: ThumbnailRequest, priority = 0) {
     this.generation = request.generation
@@ -82,8 +87,12 @@ export class ThumbnailJobQueue {
         return
       }
 
-      await Promise.all(
-        result.thumbnails.map(async (thumbnail) => {
+      let nextIndex = 0
+      const decodeWorker = async () => {
+        while (nextIndex < result.thumbnails.length) {
+          const thumbnail = result.thumbnails[nextIndex]
+          nextIndex += 1
+          if (result.generation !== this.generation) return
           const stateKey = this.makeStateKey(
             result.videoId,
             result.intervalSeconds,
@@ -95,6 +104,10 @@ export class ThumbnailJobQueue {
 
           try {
             const bitmap = await loadBitmapFromUrl(thumbnail.path)
+            if (result.generation !== this.generation) {
+              bitmap.close()
+              return
+            }
             this.cache.set(
               result.videoId,
               result.intervalSeconds,
@@ -105,7 +118,11 @@ export class ThumbnailJobQueue {
           } catch {
             this.states.set(stateKey, "missing")
           }
-        }),
+          await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
+        }
+      }
+      await Promise.all(
+        Array.from({ length: this.decodeConcurrency }, () => decodeWorker()),
       )
     } catch {
       this.setRangeState(item.request, "missing")
@@ -137,6 +154,7 @@ export class ThumbnailJobQueue {
       Math.round(request.endTime * 1000),
       Math.round(request.intervalSeconds * 1000),
       request.thumbnailWidth,
+      request.thumbnailHeight,
       request.generation,
     ].join(":")
   }

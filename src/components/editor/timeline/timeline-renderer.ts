@@ -71,6 +71,22 @@ export function renderTimelineCanvas(canvas: HTMLCanvasElement, model: TimelineR
   drawAnnotations(context, model)
   if (model.hasAudio) drawAudio(context, model, cssWidth)
   if (model.hasSubtitles) drawSubtitles(context, cssWidth)
+}
+
+export function renderTimelinePlayhead(canvas: HTMLCanvasElement, model: TimelineRenderModel) {
+  const context = canvas.getContext("2d")
+  if (!context) return
+  const dpr = window.devicePixelRatio || 1
+  const cssWidth = Math.max(1, model.range.viewportWidth)
+  const cssHeight = Math.max(1, canvas.clientHeight)
+  const targetWidth = Math.floor(cssWidth * dpr)
+  const targetHeight = Math.floor(cssHeight * dpr)
+  if (canvas.width !== targetWidth || canvas.height !== targetHeight) {
+    canvas.width = targetWidth
+    canvas.height = targetHeight
+  }
+  context.setTransform(dpr, 0, 0, dpr, 0, 0)
+  context.clearRect(0, 0, cssWidth, cssHeight)
   drawPlayhead(context, model, cssHeight)
 }
 
@@ -162,12 +178,14 @@ function drawVideoTrack(context: CanvasRenderingContext2D, model: TimelineRender
 
   for (let time = start; time < model.duration && time <= model.range.requestEnd + interval; time += interval) {
     const x = screenX(model, time)
-    const slotEnd = Math.min(model.duration, time + interval)
-    const slotWidth = Math.max(0, (slotEnd - time) * model.scale.pixelsPerSecond)
+    const slotWidth = Math.max(0, Math.min(model.lod.thumbnailWidth, contentEndX - x))
     if (slotWidth <= 0 || x > width + slotWidth || x + slotWidth < -slotWidth) continue
 
     const exact = model.cache.get(model.videoId, interval, Math.round(time * 1000) / 1000)
-    const fallback = exact ?? model.cache.findNearest(model.videoId, time, interval * 2.25)
+    const fallback =
+      exact ??
+      model.cache.getAtTimestamp(model.videoId, time) ??
+      model.cache.findNearest(model.videoId, interval, time, interval)
     if (fallback) {
       context.drawImage(fallback.bitmap, x, top + 5, slotWidth, height - 10)
     } else {
@@ -310,7 +328,10 @@ function drawAudio(context: CanvasRenderingContext2D, model: TimelineRenderModel
     if (x > width + barWidth || x + barWidth < -barWidth) continue
 
     const energy = audioPeakAtTime(model, time)
-    const barHeight = Math.max(2, energy * (height - 10))
+    // RMS values are naturally concentrated near zero. A square-root display
+    // curve reveals useful loudness differences without changing cached audio.
+    const visualEnergy = Math.sqrt(Math.max(0, Math.min(1, energy)))
+    const barHeight = Math.max(2, visualEnergy * (height - 10))
     context.fillRect(x, centerY - barHeight / 2, barWidth, barHeight)
   }
   context.restore()

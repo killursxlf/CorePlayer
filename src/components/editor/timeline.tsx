@@ -10,16 +10,18 @@ import {
   Magnet,
   Split,
   Trash2,
+  LoaderCircle,
+  CheckCircle2,
 } from "lucide-react"
 import type { Annotation, TimelineClip, TimelineMarker, VideoInfo } from "@/lib/editor-types"
 import { cn } from "@/lib/utils"
 import type { MediaService } from "@/services/media-service"
-import type { TimelineThumbnail } from "@/types/media"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
-import { generateClientTimelineThumbnails } from "./timeline/client-thumbnailer"
-import { selectTimelineLod } from "./timeline/lod-selector"
-import { renderTimelineCanvas } from "./timeline/timeline-renderer"
-import { ThumbnailCache, loadBitmapFromUrl } from "./timeline/thumbnail-cache"
+import { playbackClock } from "@/stores/playback-clock"
+import { usePerformanceStore } from "@/stores/performance-store"
+import { alignTimeToLod, selectTimelineLod } from "./timeline/lod-selector"
+import { renderTimelineCanvas, renderTimelinePlayhead } from "./timeline/timeline-renderer"
+import { ThumbnailCache } from "./timeline/thumbnail-cache"
 import { ThumbnailJobQueue, type TimelineThumbnailStatus } from "./timeline/thumbnail-request-manager"
 import {
   MAX_PIXELS_PER_SECOND,
@@ -35,16 +37,28 @@ import {
   assignAnnotationLanes,
 } from "./timeline/annotation-lanes"
 
+const THUMBNAIL_SCHEDULER = {
+  playingBatchSize: 3,
+  visibleBatchSize: 3,
+  pausedBatchSize: 6,
+  visibleDelayMs: 80,
+  nearDelayMs: 300,
+  prefetchDelayMs: 800,
+} as const
+const WAVEFORM_SECONDS_PER_PEAK = 25
+const WAVEFORM_CHUNK_SECONDS = 300
+const WAVEFORM_IDLE_DELAY_MS = 1_500
+const WAVEFORM_CHUNK_YIELD_MS = 350
+const WAVEFORM_ENABLED = false
+
 interface TimelineProps {
-  currentTime: number
   duration: number
   playbackUrl: string | null
   originalPath: string | null
   videoId: string | null
-  thumbnails: TimelineThumbnail[]
   mediaService: MediaService
   videoInfo: VideoInfo
-  audioPeaks: number[]
+  isPlaying: boolean
   onSeek: (t: number) => void
   pxPerSecond: number
   onPxPerSecondChange: (v: number) => void
@@ -77,15 +91,13 @@ function nearestTrackAnnotation(
 }
 
 export function Timeline({
-  currentTime,
   duration,
   playbackUrl,
   originalPath,
   videoId,
-  thumbnails,
   mediaService,
   videoInfo,
-  audioPeaks,
+  isPlaying,
   onSeek,
   pxPerSecond,
   onPxPerSecondChange,
@@ -107,14 +119,30 @@ export function Timeline({
 }: TimelineProps) {
   const scrollRef = useRef<HTMLDivElement>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
+  const playheadCanvasRef = useRef<HTMLCanvasElement>(null)
+  const playheadHandleRef = useRef<HTMLDivElement>(null)
   const rafRef = useRef<number | null>(null)
-  const zoomDebounceRef = useRef<number | null>(null)
   const generationRef = useRef(0)
-  const clientGenerationRef = useRef(0)
   const userZoomedRef = useRef(false)
+  const lastActivitySignalRef = useRef(0)
   const [thumbnailCache] = useState(() => new ThumbnailCache())
   const [viewport, setViewport] = useState({ width: 0, scrollLeft: 0 })
-  const [cacheVersion, setCacheVersion] = useState(0)
+  const [waveformCache, setWaveformCache] = useState<{ videoId: string | null; peaks: number[] }>({
+    videoId: null,
+    peaks: [],
+  })
+  const audioPeaks = useMemo(
+    () => (waveformCache.videoId === videoId ? waveformCache.peaks : []),
+    [videoId, waveformCache],
+  )
+  const performanceConfig = usePerformanceStore((state) => state.config)
+  const setPerformanceConfig = usePerformanceStore((state) => state.setConfig)
+  const thumbnailBatchBudget = performanceConfig?.thumbnailBudget.batchSize
+  const thumbnailPrefetchAllowed = performanceConfig?.thumbnailBudget.prefetchAllowed
+  const waveformAllowed = performanceConfig?.waveformBudget.allowed
+  const waveformChunkBudget = performanceConfig?.waveformBudget.maxChunkSeconds
+  const waveformGenerationRef = useRef(0)
+  const waveformChunksRef = useRef(new Set<string>())
   const [thumbnailStatus, setThumbnailStatus] = useState<TimelineThumbnailStatus>({
     generation: 0,
     cacheDir: null,
@@ -150,8 +178,21 @@ export function Timeline({
     [mediaService, onCacheDirChange, thumbnailCache],
   )
 
+  useEffect(() => {
+    const budget = performanceConfig?.thumbnailBudget
+    if (!budget) return
+    thumbnailCache.configure(250, budget.ramCacheBytes)
+    jobQueue.setDecodeConcurrency(budget.decodeConcurrency)
+  }, [jobQueue, performanceConfig, thumbnailCache])
+
+  useEffect(() => {
+    waveformGenerationRef.current += 1
+    waveformChunksRef.current.clear()
+  }, [videoId])
+
   const hasAnnotations = annotations.length > 0
-  const hasAudio = Boolean(playbackUrl) && videoInfo.audioStreams !== "None"
+  const hasAudio =
+    WAVEFORM_ENABLED && Boolean(playbackUrl) && videoInfo.audioStreams !== "None"
   const hasSubtitles = videoInfo.subtitles !== "None"
   const showClipControls =
     clips.length > 1 ||
@@ -166,8 +207,56 @@ export function Timeline({
     [hasAnnotations, hasAudio, hasSubtitles],
   )
   const annotationLanes = useMemo(() => assignAnnotationLanes(annotations), [annotations])
+  const timelineProgress = useMemo(() => {
+    if (!videoId) return { total: 0, ready: 0, pending: 0 }
+    const prefix = `${videoId}:${Math.round(lod.intervalSeconds * 1000)}:`
+    const activeStates = [...thumbnailStatus.states.entries()]
+      .filter(([key]) => key.startsWith(prefix))
+      .map(([, state]) => state)
+      .filter((state) => state === "queued" || state === "loading")
+    let total = 0
+    let ready = 0
+    const progressStart = alignTimeToLod(range.visibleStart, lod.intervalSeconds)
+    const progressEnd = Math.min(duration, range.visibleEnd)
+    for (let time = progressStart; time < progressEnd; time += lod.intervalSeconds) {
+      total += 1
+      const rounded = Math.round(time * 1000) / 1000
+      if (
+        thumbnailCache.get(videoId, lod.intervalSeconds, rounded) ||
+        thumbnailCache.getAtTimestamp(videoId, rounded) ||
+        thumbnailCache.findNearest(videoId, lod.intervalSeconds, rounded, lod.intervalSeconds)
+      ) {
+        ready += 1
+      }
+    }
+    return {
+      total,
+      ready,
+      pending: activeStates.length,
+    }
+  }, [
+    duration,
+    lod.intervalSeconds,
+    range.visibleEnd,
+    range.visibleStart,
+    thumbnailCache,
+    thumbnailStatus.states,
+    videoId,
+  ])
 
   const scheduleViewportRead = useCallback(() => {
+    const now = Date.now()
+    if (now - lastActivitySignalRef.current >= 1000) {
+      lastActivitySignalRef.current = now
+      void mediaService
+        .updateRuntimeMetrics({
+          droppedFrameRatio: performanceConfig?.droppedFrameRatio ?? 0,
+          userActive: true,
+          windowVisible: document.visibilityState === "visible",
+        })
+        .then(setPerformanceConfig)
+        .catch(() => undefined)
+    }
     if (rafRef.current != null) return
     rafRef.current = requestAnimationFrame(() => {
       rafRef.current = null
@@ -175,7 +264,7 @@ export function Timeline({
       if (!el) return
       setViewport({ width: el.clientWidth, scrollLeft: el.scrollLeft })
     })
-  }, [])
+  }, [mediaService, performanceConfig?.droppedFrameRatio, setPerformanceConfig])
 
   useEffect(() => {
     const el = scrollRef.current
@@ -207,79 +296,55 @@ export function Timeline({
     onPxPerSecondChange(fittedPixelsPerSecond)
   }, [duration, onPxPerSecondChange, pxPerSecond, viewport.width])
 
-  useEffect(() => {
-    if (!videoId || thumbnails.length === 0) return
-    let cancelled = false
-    void Promise.all(
-      thumbnails.map(async (thumbnail) => {
-        try {
-          const bitmap = await loadBitmapFromUrl(thumbnail.url)
-          if (cancelled) {
-            bitmap.close()
-            return
-          }
-          thumbnailCache.set(videoId, lod.intervalSeconds, thumbnail.time, bitmap, thumbnail.url)
-          setCacheVersion((version) => version + 1)
-        } catch {
-          // Old fixed thumbnails are an opportunistic warm cache only.
-        }
-      }),
-    )
-    return () => {
-      cancelled = true
-    }
-  }, [lod.intervalSeconds, thumbnailCache, thumbnails, videoId])
-
-  useEffect(() => {
-    if (!playbackUrl || !videoId || duration <= 0 || viewport.width <= 0) return
-
-    clientGenerationRef.current += 1
-    const generation = clientGenerationRef.current
-    const timeout = window.setTimeout(() => {
-      void generateClientTimelineThumbnails({
-        playbackUrl,
-        videoId,
-        range,
-        intervalSeconds: lod.intervalSeconds,
-        thumbnailWidth: Math.round(lod.thumbnailWidth),
-        thumbnailHeight: 34,
-        duration,
-        cache: thumbnailCache,
-        generation,
-        isCurrent: (candidate) => candidate === clientGenerationRef.current,
-        onFrame: () => setCacheVersion((version) => version + 1),
-      })
-    }, 180)
-
-    return () => {
-      window.clearTimeout(timeout)
-    }
-  }, [
-    duration,
-    lod.intervalSeconds,
-    lod.thumbnailWidth,
-    playbackUrl,
-    range,
-    thumbnailCache,
-    videoId,
-    viewport.width,
-  ])
-
   const requestThumbnails = useCallback(
-    (generation: number) => {
-      if (!originalPath || !videoId || duration <= 0 || viewport.width <= 0) return
-      jobQueue.request(
-        {
-          videoId,
-          filePath: originalPath,
-          startTime: range.requestStart,
-          endTime: range.requestEnd,
-          intervalSeconds: lod.intervalSeconds,
-          thumbnailWidth: Math.round(lod.thumbnailWidth),
-          generation,
-        },
-        10,
-      )
+    (
+      generation: number,
+      startTime: number,
+      endTime: number,
+      priority: number,
+      priorityLevel: "visible" | "near" | "prefetch",
+      batchSize: number,
+    ) => {
+      if (!originalPath || !videoId || duration <= 0 || viewport.width <= 0 || endTime <= startTime) return
+      const interval = lod.intervalSeconds
+      const first = alignTimeToLod(Math.max(0, startTime), interval)
+      const timestamps: number[] = []
+      for (let time = first; time <= Math.min(duration, endTime) + interval * 0.25; time += interval) {
+        const rounded = Math.round(time * 1000) / 1000
+        if (
+          !thumbnailCache.get(videoId, interval, rounded) &&
+          !thumbnailCache.getAtTimestamp(videoId, rounded)
+        ) {
+          timestamps.push(rounded)
+        }
+      }
+      const center = (range.visibleStart + range.visibleEnd) / 2
+      const batches: number[][] = []
+      for (let offset = 0; offset < timestamps.length; offset += batchSize) {
+        batches.push(timestamps.slice(offset, offset + batchSize))
+      }
+      batches
+        .sort((left, right) => {
+          const leftCenter = (left[0] + left[left.length - 1]) / 2
+          const rightCenter = (right[0] + right[right.length - 1]) / 2
+          return Math.abs(leftCenter - center) - Math.abs(rightCenter - center)
+        })
+        .forEach((batch, index) => {
+          jobQueue.request(
+            {
+              videoId,
+              filePath: originalPath,
+              startTime: batch[0],
+              endTime: batch[batch.length - 1],
+              intervalSeconds: interval,
+              thumbnailWidth: Math.round(lod.thumbnailWidth),
+              thumbnailHeight: 30,
+              generation,
+              priority: priorityLevel,
+            },
+            priority - index * 0.001,
+          )
+        })
     },
     [
       duration,
@@ -287,8 +352,9 @@ export function Timeline({
       lod.intervalSeconds,
       lod.thumbnailWidth,
       originalPath,
-      range.requestEnd,
-      range.requestStart,
+      range.visibleEnd,
+      range.visibleStart,
+      thumbnailCache,
       videoId,
       viewport.width,
     ],
@@ -298,16 +364,144 @@ export function Timeline({
     generationRef.current += 1
     const generation = generationRef.current
     jobQueue.cancelQueuedBefore(generation)
-
-    if (zoomDebounceRef.current != null) window.clearTimeout(zoomDebounceRef.current)
-    zoomDebounceRef.current = window.setTimeout(() => {
-      requestThumbnails(generation)
-    }, 150)
+    void mediaService.cancelBackgroundMedia().catch(() => undefined)
+    const configuredBatchSize = thumbnailBatchBudget
+    const batchSize = configuredBatchSize ?? (isPlaying
+      ? THUMBNAIL_SCHEDULER.playingBatchSize
+      : THUMBNAIL_SCHEDULER.pausedBatchSize)
+    const timers = [
+      window.setTimeout(() => {
+        requestThumbnails(
+          generation,
+          range.visibleStart,
+          range.visibleEnd,
+          300,
+          "visible",
+          isPlaying ? batchSize : THUMBNAIL_SCHEDULER.visibleBatchSize,
+        )
+      }, THUMBNAIL_SCHEDULER.visibleDelayMs),
+    ]
+    if (!isPlaying) {
+      timers.push(
+        window.setTimeout(() => {
+          requestThumbnails(generation, range.nearStart, range.visibleStart, 200, "near", batchSize)
+          requestThumbnails(generation, range.visibleEnd, range.nearEnd, 200, "near", batchSize)
+        }, THUMBNAIL_SCHEDULER.nearDelayMs),
+        ...(thumbnailPrefetchAllowed !== false
+          ? [window.setTimeout(() => {
+              requestThumbnails(generation, range.prefetchStart, range.nearStart, 100, "prefetch", batchSize)
+              requestThumbnails(generation, range.nearEnd, range.prefetchEnd, 100, "prefetch", batchSize)
+            }, THUMBNAIL_SCHEDULER.prefetchDelayMs)]
+          : []),
+      )
+    }
 
     return () => {
-      if (zoomDebounceRef.current != null) window.clearTimeout(zoomDebounceRef.current)
+      timers.forEach((timer) => window.clearTimeout(timer))
     }
-  }, [jobQueue, requestThumbnails])
+  }, [
+    isPlaying,
+    jobQueue,
+    mediaService,
+    range,
+    requestThumbnails,
+    thumbnailBatchBudget,
+    thumbnailPrefetchAllowed,
+  ])
+
+  useEffect(() => {
+    if (
+      isPlaying ||
+      !originalPath ||
+      !videoId ||
+      !hasAudio ||
+      waveformAllowed === false ||
+      duration <= 0 ||
+      range.requestEnd <= range.requestStart
+    ) return
+
+    const generation = waveformGenerationRef.current
+    const chunkSeconds =
+      waveformChunkBudget || WAVEFORM_CHUNK_SECONDS
+    const firstChunk = Math.floor(range.requestStart / chunkSeconds)
+    const lastChunk = Math.max(firstChunk, Math.ceil(range.requestEnd / chunkSeconds) - 1)
+    const visibleCenter = (range.visibleStart + range.visibleEnd) / 2
+    const chunks = Array.from(
+      { length: lastChunk - firstChunk + 1 },
+      (_, index) => firstChunk + index,
+    ).sort((left, right) => {
+      const leftCenter = (left + 0.5) * chunkSeconds
+      const rightCenter = (right + 0.5) * chunkSeconds
+      return Math.abs(leftCenter - visibleCenter) - Math.abs(rightCenter - visibleCenter)
+    })
+    let cancelled = false
+    const timeout = window.setTimeout(() => {
+      void (async () => {
+        for (const chunk of chunks) {
+          if (cancelled || generation !== waveformGenerationRef.current) return
+          const chunkKey = `${videoId}:${chunkSeconds}:${chunk}`
+          if (waveformChunksRef.current.has(chunkKey)) continue
+          waveformChunksRef.current.add(chunkKey)
+          const startTime = chunk * chunkSeconds
+          const endTime = Math.min(duration, startTime + chunkSeconds)
+          let waveform
+          try {
+            waveform = await mediaService.generateAudioWaveform({
+              videoId,
+              filePath: originalPath,
+              startTime,
+              endTime,
+              peakCount: Math.max(
+                1,
+                Math.ceil((endTime - startTime) / WAVEFORM_SECONDS_PER_PEAK),
+              ),
+            })
+          } catch {
+            waveformChunksRef.current.delete(chunkKey)
+            return
+          }
+          if (generation !== waveformGenerationRef.current || waveform.videoId !== videoId) return
+          const totalPeakCount = Math.max(
+            1,
+            Math.ceil(duration / WAVEFORM_SECONDS_PER_PEAK),
+          )
+          setWaveformCache((previous) => {
+            const previousPeaks = previous.videoId === videoId ? previous.peaks : []
+            const next = previousPeaks.length === totalPeakCount
+              ? [...previousPeaks]
+              : new Array<number>(totalPeakCount).fill(0)
+            waveform.peaks.forEach((peak, index) => {
+              const time = waveform.startTime +
+                (index / Math.max(1, waveform.peaks.length)) * (waveform.endTime - waveform.startTime)
+              const target = Math.min(totalPeakCount - 1, Math.floor((time / duration) * totalPeakCount))
+              next[target] = peak
+            })
+            return { videoId, peaks: next }
+          })
+          await new Promise<void>((resolve) => {
+            window.setTimeout(resolve, WAVEFORM_CHUNK_YIELD_MS)
+          })
+        }
+      })().catch(() => undefined)
+    }, WAVEFORM_IDLE_DELAY_MS)
+    return () => {
+      cancelled = true
+      window.clearTimeout(timeout)
+    }
+  }, [
+    duration,
+    hasAudio,
+    isPlaying,
+    mediaService,
+    originalPath,
+    range.requestEnd,
+    range.requestStart,
+    range.visibleEnd,
+    range.visibleStart,
+    videoId,
+    waveformAllowed,
+    waveformChunkBudget,
+  ])
 
   useEffect(() => {
     const canvas = canvasRef.current
@@ -316,7 +510,7 @@ export function Timeline({
     const frame = requestAnimationFrame(() => {
       renderTimelineCanvas(canvas, {
         duration,
-        currentTime,
+        currentTime: 0,
         trim,
         clips,
         selectedClipId,
@@ -340,7 +534,6 @@ export function Timeline({
   }, [
     annotations,
     audioPeaks,
-    currentTime,
     duration,
     hasAudio,
     hasSubtitles,
@@ -351,11 +544,72 @@ export function Timeline({
     selectedId,
     thumbnailStatus,
     thumbnailCache,
-    cacheVersion,
     clips,
     trim,
     selectedClipId,
     selectedClipIds,
+    videoId,
+    viewport.width,
+  ])
+
+  useEffect(() => {
+    const canvas = playheadCanvasRef.current
+    if (!canvas || viewport.width <= 0) return
+    let frame: number | null = null
+    const draw = (time = playbackClock.getSnapshot()) => {
+      const handle = playheadHandleRef.current
+      if (handle) {
+        const x = scale.timeToX(time) - range.scrollLeft
+        handle.style.transform = `translate3d(${x - 10}px, 0, 0)`
+        handle.style.visibility = x >= -10 && x <= viewport.width + 10 ? "visible" : "hidden"
+      }
+      if (frame != null) cancelAnimationFrame(frame)
+      frame = requestAnimationFrame(() => {
+      renderTimelinePlayhead(canvas, {
+        duration,
+        currentTime: time,
+        trim,
+        clips,
+        selectedClipId,
+        selectedClipIds,
+        markers,
+        annotations,
+        selectedId,
+        hasAudio,
+        hasSubtitles,
+        audioPeaks,
+        videoId: videoId ?? "no-video",
+        range,
+        scale,
+        lod,
+        cache: thumbnailCache,
+        states: thumbnailStatus.states,
+      })
+      })
+    }
+    draw()
+    const unsubscribe = playbackClock.subscribe(draw)
+    return () => {
+      unsubscribe()
+      if (frame != null) cancelAnimationFrame(frame)
+    }
+  }, [
+    annotations,
+    audioPeaks,
+    clips,
+    duration,
+    hasAudio,
+    hasSubtitles,
+    lod,
+    markers,
+    range,
+    scale,
+    selectedClipId,
+    selectedClipIds,
+    selectedId,
+    thumbnailCache,
+    thumbnailStatus.states,
+    trim,
     videoId,
     viewport.width,
   ])
@@ -374,8 +628,44 @@ export function Timeline({
     [duration, scale],
   )
 
+  const movePlayheadFromPointer = useCallback(
+    (clientX: number) => {
+      const time = timeFromClientX(clientX, scale.pixelsPerFrame >= 20)
+      playbackClock.set(time)
+      onSeek(time)
+    },
+    [onSeek, scale.pixelsPerFrame, timeFromClientX],
+  )
+
+  const handlePlayheadPointerDown = useCallback(
+    (event: React.PointerEvent<HTMLDivElement>) => {
+      if (event.button !== 0) return
+      event.preventDefault()
+      event.stopPropagation()
+      event.currentTarget.setPointerCapture(event.pointerId)
+      movePlayheadFromPointer(event.clientX)
+    },
+    [movePlayheadFromPointer],
+  )
+
+  const handlePlayheadPointerMove = useCallback(
+    (event: React.PointerEvent<HTMLDivElement>) => {
+      if (!event.currentTarget.hasPointerCapture(event.pointerId)) return
+      if ((event.buttons & 1) === 0) {
+        event.currentTarget.releasePointerCapture(event.pointerId)
+        return
+      }
+      event.preventDefault()
+      event.stopPropagation()
+      movePlayheadFromPointer(event.clientX)
+    },
+    [movePlayheadFromPointer],
+  )
+
   const handleScrub = useCallback(
     (event: React.PointerEvent) => {
+      if (event.button !== 0) return
+      event.preventDefault()
       const rect = event.currentTarget.getBoundingClientRect()
       const localY = event.clientY - rect.top
       const time = timeFromClientX(event.clientX, scale.pixelsPerFrame >= 20)
@@ -405,25 +695,36 @@ export function Timeline({
         return
       }
 
-      onSeek(time)
-      const move = (moveEvent: PointerEvent) => {
-        onSeek(timeFromClientX(moveEvent.clientX, scale.pixelsPerFrame >= 20))
-      }
-      const up = () => {
+      movePlayheadFromPointer(event.clientX)
+      let active = true
+      const cleanup = () => {
+        if (!active) return
+        active = false
         window.removeEventListener("pointermove", move)
-        window.removeEventListener("pointerup", up)
+        window.removeEventListener("pointerup", cleanup)
+        window.removeEventListener("pointercancel", cleanup)
+        window.removeEventListener("blur", cleanup)
+      }
+      const move = (moveEvent: PointerEvent) => {
+        if ((moveEvent.buttons & 1) === 0) {
+          cleanup()
+          return
+        }
+        movePlayheadFromPointer(moveEvent.clientX)
       }
       window.addEventListener("pointermove", move)
-      window.addEventListener("pointerup", up)
+      window.addEventListener("pointerup", cleanup)
+      window.addEventListener("pointercancel", cleanup)
+      window.addEventListener("blur", cleanup)
     },
     [
       annotations,
       clips,
-      onSeek,
       onSelectAnnotation,
       onSelectClip,
       range,
       scale,
+      movePlayheadFromPointer,
       timeFromClientX,
     ],
   )
@@ -474,12 +775,14 @@ export function Timeline({
   )
 
   const setInAtPlayhead = useCallback(() => {
+    const currentTime = playbackClock.getSnapshot()
     onTrimChange([Math.min(currentTime, trim[1] - scale.frameDuration), trim[1]])
-  }, [currentTime, onTrimChange, scale.frameDuration, trim])
+  }, [onTrimChange, scale.frameDuration, trim])
 
   const setOutAtPlayhead = useCallback(() => {
+    const currentTime = playbackClock.getSnapshot()
     onTrimChange([trim[0], Math.max(currentTime, trim[0] + scale.frameDuration)])
-  }, [currentTime, onTrimChange, scale.frameDuration, trim])
+  }, [onTrimChange, scale.frameDuration, trim])
 
   const dragAnnotationTime = useCallback(
     (annotation: Annotation, mode: "move" | "start" | "end") => (event: React.PointerEvent) => {
@@ -574,6 +877,48 @@ export function Timeline({
         </button>
 
         <div className="ml-auto flex items-center gap-2">
+          {timelineProgress.total > 0 &&
+          timelineProgress.ready >= timelineProgress.total ? (
+            <span className="flex items-center gap-1 rounded-md px-2 py-1 text-[11px] text-emerald-400">
+              <CheckCircle2 className="size-3" />
+              Timeline ready
+            </span>
+          ) : timelineProgress.pending > 0 ? (
+            <span className="flex items-center gap-1.5 rounded-md bg-primary/10 px-2 py-1 text-[11px] text-primary">
+              <LoaderCircle className="size-3 animate-spin" />
+              Optimizing timeline {timelineProgress.ready}/{timelineProgress.total}
+            </span>
+          ) : timelineProgress.total > 0 ? (
+            <span className="flex items-center gap-1 rounded-md px-2 py-1 text-[11px] text-emerald-400">
+              <CheckCircle2 className="size-3" />
+              Timeline ready
+            </span>
+          ) : videoId ? (
+            <span className="flex items-center gap-1.5 px-2 py-1 text-[11px] text-muted-foreground">
+              <LoaderCircle className="size-3 animate-spin" />
+              Preparing timeline
+            </span>
+          ) : null}
+          <select
+            value={performanceConfig?.preset ?? "auto"}
+            onChange={(event) => {
+              const preset = event.currentTarget.value as NonNullable<typeof performanceConfig>["preset"]
+              void mediaService
+                .setPerformancePreset(preset)
+                .then(() => mediaService.getRuntimePerformanceConfig())
+                .then(setPerformanceConfig)
+                .catch(() => undefined)
+            }}
+            className="h-7 rounded-md border border-border bg-secondary/60 px-2 text-xs text-foreground outline-none"
+            aria-label="Performance preset"
+            title={`Pressure: ${performanceConfig?.pressure ?? "unknown"}`}
+          >
+            <option value="auto">Auto</option>
+            <option value="powerSaver">Power Saver</option>
+            <option value="balanced">Balanced</option>
+            <option value="performance">Performance</option>
+            <option value="custom">Custom</option>
+          </select>
           {showClipControls && (
             <select
               value={selectedClipId ?? ""}
@@ -619,7 +964,7 @@ export function Timeline({
                   </button>
                 }
               />
-              <TooltipContent>Delete selected clip</TooltipContent>
+              <TooltipContent>Delete selected clip (Delete)</TooltipContent>
             </Tooltip>
           )}
           <span className="font-mono text-[11px] tabular-nums text-muted-foreground">
@@ -654,12 +999,47 @@ export function Timeline({
           onWheel={handleWheel}
         >
           <div className="relative h-full" style={{ width }}>
-            <canvas
-              ref={canvasRef}
-              className="sticky left-0 top-0 block h-full"
-              style={{ width: viewport.width, height: "100%" }}
+            <div
+              className="sticky left-0 top-0 h-full"
+              style={{ width: viewport.width }}
               onPointerDown={handleScrub}
-            />
+            >
+              <canvas
+                ref={canvasRef}
+                className="absolute inset-0 block h-full"
+                style={{ width: viewport.width, height: "100%" }}
+              />
+              <canvas
+                ref={playheadCanvasRef}
+                className="pointer-events-none absolute inset-0 z-10 block h-full"
+                style={{ width: viewport.width, height: "100%" }}
+              />
+              <div
+                ref={playheadHandleRef}
+                role="slider"
+                aria-label="Playhead"
+                aria-valuemin={0}
+                aria-valuemax={duration}
+                aria-valuenow={playbackClock.getSnapshot()}
+                tabIndex={0}
+                className="group/playhead absolute inset-y-0 left-0 z-20 w-5 cursor-col-resize touch-none select-none"
+                onPointerDown={handlePlayheadPointerDown}
+                onPointerMove={handlePlayheadPointerMove}
+                onPointerUp={(event) => {
+                  event.stopPropagation()
+                  if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+                    event.currentTarget.releasePointerCapture(event.pointerId)
+                  }
+                }}
+                onPointerCancel={(event) => {
+                  if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+                    event.currentTarget.releasePointerCapture(event.pointerId)
+                  }
+                }}
+              >
+                <div className="pointer-events-none absolute inset-y-0 left-1/2 w-1 -translate-x-1/2 bg-rose-400/0 transition-colors group-hover/playhead:bg-rose-400/25" />
+              </div>
+            </div>
             {annotations.map((annotation) => {
               const left = scale.timeToX(annotation.startTime)
               const annotationWidth = Math.max(28, (annotation.endTime - annotation.startTime) * scale.pixelsPerSecond)

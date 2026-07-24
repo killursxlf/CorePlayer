@@ -22,6 +22,7 @@ import { formatTimecode } from "@/lib/editor-types"
 import { cn } from "@/lib/utils"
 import { Slider } from "@/components/ui/slider"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
+import { playbackClock } from "@/stores/playback-clock"
 
 const SPEEDS = ["0.25", "0.5", "1", "1.5", "2"]
 
@@ -29,6 +30,7 @@ interface PreviewProps {
   videoInfo: VideoInfo
   playbackUrl: string | null
   currentTime: number
+  seekRevision: number
   duration: number
   isPlaying: boolean
   onTogglePlay: () => void
@@ -51,6 +53,11 @@ interface PreviewProps {
   onOpenVideo: () => void
   hasMedia: boolean
   isLoading: boolean
+  onPerformanceMetrics?: (metrics: {
+    droppedFrameRatio: number
+    userActive: boolean
+    windowVisible: boolean
+  }) => void
 }
 
 type NormalizedPoint = { x: number; y: number }
@@ -462,6 +469,7 @@ export function Preview({
   videoInfo,
   playbackUrl,
   currentTime,
+  seekRevision,
   duration,
   isPlaying,
   onTogglePlay,
@@ -484,6 +492,7 @@ export function Preview({
   onOpenVideo,
   hasMedia,
   isLoading,
+  onPerformanceMetrics,
 }: PreviewProps) {
   const previewRef = useRef<HTMLDivElement | null>(null)
   const videoSurfaceRef = useRef<HTMLDivElement | null>(null)
@@ -493,6 +502,8 @@ export function Preview({
   const [zoomOrigin, setZoomOrigin] = useState("50% 50%")
   const [draft, setDraft] = useState<DraftAnnotation | null>(null)
   const [didDragTool, setDidDragTool] = useState(false)
+  const [isSeekingMedia, setIsSeekingMedia] = useState(false)
+  const [seekError, setSeekError] = useState<string | null>(null)
   const frame = 1 / videoInfo.fps
   const visibleAnnotations = annotations.filter(
     (a) => a.visible && currentTime >= a.startTime && currentTime <= a.endTime,
@@ -657,10 +668,92 @@ export function Preview({
     const video = videoRef.current
     if (!video) return
 
-    if (Math.abs(video.currentTime - currentTime) > 0.25) {
-      video.currentTime = currentTime
+    video.pause()
+    video.removeAttribute("src")
+    video.load()
+    setIsSeekingMedia(false)
+    setSeekError(null)
+    if (playbackUrl) {
+      video.src = playbackUrl
+      video.load()
     }
-  }, [currentTime])
+  }, [playbackUrl])
+
+  useEffect(() => {
+    const video = videoRef.current
+    if (!video || !playbackUrl || seekRevision === 0) return
+
+    const target = Math.max(0, Math.min(currentTime, Number.isFinite(video.duration) ? video.duration : currentTime))
+    let cancelled = false
+    let timeout: number | null = null
+    let recoveryAttempted = false
+
+    const diagnostics = () => ({
+      target,
+      seekRevision,
+      readyState: video.readyState,
+      networkState: video.networkState,
+      error: video.error?.message ?? null,
+      buffered: Array.from({ length: video.buffered.length }, (_, index) => [
+        video.buffered.start(index),
+        video.buffered.end(index),
+      ]),
+      seekable: Array.from({ length: video.seekable.length }, (_, index) => [
+        video.seekable.start(index),
+        video.seekable.end(index),
+      ]),
+    })
+
+    const finish = () => {
+      if (cancelled) return
+      if (timeout != null) window.clearTimeout(timeout)
+      setIsSeekingMedia(false)
+      setSeekError(null)
+      if (isPlaying) void video.play().catch(() => undefined)
+    }
+
+    const armTimeout = () => {
+      if (timeout != null) window.clearTimeout(timeout)
+      timeout = window.setTimeout(() => {
+        if (cancelled) return
+        if (import.meta.env.DEV) console.warn("[media-seek:timeout]", diagnostics())
+        if (!recoveryAttempted) {
+          recoveryAttempted = true
+          video.pause()
+          video.removeAttribute("src")
+          video.load()
+          const separator = playbackUrl.includes("?") ? "&" : "?"
+          video.src = `${playbackUrl}${separator}sourceGeneration=${seekRevision}`
+          video.addEventListener("loadedmetadata", () => {
+            if (cancelled) return
+            video.currentTime = target
+            armTimeout()
+          }, { once: true })
+          video.load()
+          return
+        }
+        setIsSeekingMedia(false)
+        setSeekError("Could not seek this media file. The container index or codec may be unsupported.")
+      }, 8_000)
+    }
+
+    setIsSeekingMedia(true)
+    setSeekError(null)
+    video.addEventListener("seeked", finish)
+    video.addEventListener("canplay", finish)
+    video.currentTime = target
+    armTimeout()
+    if (import.meta.env.DEV) console.info("[media-seek:start]", diagnostics())
+    return () => {
+      cancelled = true
+      if (timeout != null) window.clearTimeout(timeout)
+      video.removeEventListener("seeked", finish)
+      video.removeEventListener("canplay", finish)
+    }
+  // currentTime and isPlaying are sampled when the explicit seek revision changes;
+  // ordinary timeupdate events must not restart this state machine.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [playbackUrl, seekRevision])
 
   useEffect(() => {
     const video = videoRef.current
@@ -686,6 +779,87 @@ export function Preview({
 
     video.playbackRate = Number.parseFloat(playbackSpeed)
   }, [playbackSpeed])
+
+  useEffect(() => {
+    const video = videoRef.current
+    if (!video || !playbackUrl) return
+    let cancelled = false
+    let frameRequest: number | null = null
+    let animationFrame: number | null = null
+
+    const update = () => {
+      if (cancelled) return
+      playbackClock.set(video.currentTime)
+      if ("requestVideoFrameCallback" in video) {
+        frameRequest = video.requestVideoFrameCallback(update)
+      } else {
+        animationFrame = requestAnimationFrame(update)
+      }
+    }
+    update()
+    return () => {
+      cancelled = true
+      if (frameRequest != null && "cancelVideoFrameCallback" in video) {
+        video.cancelVideoFrameCallback(frameRequest)
+      }
+      if (animationFrame != null) cancelAnimationFrame(animationFrame)
+    }
+  }, [playbackUrl])
+
+  useEffect(() => {
+    if (!isPlaying) return
+    const video = videoRef.current
+    if (!video) return
+    let longTaskCount = 0
+    let longTaskDuration = 0
+    const observer = typeof PerformanceObserver !== "undefined"
+      ? new PerformanceObserver((entries) => {
+          for (const entry of entries.getEntries()) {
+            longTaskCount += 1
+            longTaskDuration += entry.duration
+          }
+        })
+      : null
+    try {
+      observer?.observe({ entryTypes: ["longtask"] })
+    } catch {
+      observer?.disconnect()
+    }
+    const initial = video.getVideoPlaybackQuality?.()
+    let lastTotalFrames = initial?.totalVideoFrames ?? 0
+    let lastDroppedFrames = initial?.droppedVideoFrames ?? 0
+    const startedAt = performance.now()
+    let samples = 0
+    const interval = window.setInterval(() => {
+      const quality = video.getVideoPlaybackQuality?.()
+      if (!quality) return
+      const totalDelta = Math.max(0, quality.totalVideoFrames - lastTotalFrames)
+      const droppedDelta = Math.max(0, quality.droppedVideoFrames - lastDroppedFrames)
+      lastTotalFrames = quality.totalVideoFrames
+      lastDroppedFrames = quality.droppedVideoFrames
+      const droppedFrameRatio = totalDelta > 0 ? droppedDelta / totalDelta : 0
+      onPerformanceMetrics?.({
+        droppedFrameRatio,
+        userActive: false,
+        windowVisible: document.visibilityState === "visible",
+      })
+      samples += 1
+      if (import.meta.env.DEV && samples % 5 === 0) {
+        console.info("[media-profile]", {
+          elapsedSeconds: Math.round((performance.now() - startedAt) / 100) / 10,
+          decodedFrames: quality.totalVideoFrames - (initial?.totalVideoFrames ?? 0),
+          droppedFrames: quality.droppedVideoFrames - (initial?.droppedVideoFrames ?? 0),
+          droppedFrameRatio,
+          longTasks: longTaskCount,
+          longTaskMilliseconds: Math.round(longTaskDuration),
+        })
+      }
+    }, 1000)
+    return () => {
+      window.clearInterval(interval)
+      observer?.disconnect()
+    }
+  }, [isPlaying, onPerformanceMetrics, playbackUrl])
 
   return (
     <div
@@ -778,7 +952,6 @@ export function Preview({
           {playbackUrl && (
             <video
               ref={videoRef}
-              src={playbackUrl}
               className="absolute inset-0 size-full object-contain"
               preload="metadata"
               onLoadedMetadata={(event) =>
@@ -788,6 +961,12 @@ export function Preview({
                 })
               }
               onTimeUpdate={(event) => onTimeUpdate(event.currentTarget.currentTime)}
+              onSeeking={() => setIsSeekingMedia(true)}
+              onSeeked={() => setIsSeekingMedia(false)}
+              onError={(event) => {
+                const message = event.currentTarget.error?.message
+                if (message) setSeekError(message)
+              }}
               onEnded={onEnded}
             />
           )}
@@ -807,6 +986,16 @@ export function Preview({
             </div>
           </div>
           {draft && <DraftOverlay draft={draft} />}
+          {isSeekingMedia && (
+            <div className="pointer-events-none absolute bottom-3 left-1/2 -translate-x-1/2 rounded-md bg-black/70 px-2 py-1 text-xs text-white">
+              Seeking…
+            </div>
+          )}
+          {seekError && (
+            <div className="pointer-events-none absolute bottom-3 left-1/2 max-w-[80%] -translate-x-1/2 rounded-md bg-destructive/90 px-3 py-2 text-center text-xs text-destructive-foreground">
+              {seekError}
+            </div>
+          )}
           {/* center play affordance */}
           {!isPlaying && playbackUrl && (
             <span className="pointer-events-none absolute left-1/2 top-1/2 flex size-16 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-full bg-background/40 backdrop-blur-sm transition-opacity group-hover:opacity-100">

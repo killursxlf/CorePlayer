@@ -1,7 +1,7 @@
 "use client"
 
 import { useCallback, useEffect, useRef, useState } from "react"
-import { PanelRightOpen } from "lucide-react"
+import { LoaderCircle, PanelRightOpen } from "lucide-react"
 import { MenuBar } from "@/components/editor/menu-bar"
 import { Toolbar } from "@/components/editor/toolbar"
 import { ToolSidebar } from "@/components/editor/tool-sidebar"
@@ -21,11 +21,13 @@ import {
   type ProjectFile,
 } from "@/services/project-service"
 import { useMediaStore } from "@/stores/media-store"
+import { usePerformanceStore } from "@/stores/performance-store"
+import { playbackClock } from "@/stores/playback-clock"
 import { createAppError } from "@/types/app-error"
 import { isValidTrimRange } from "@/utils/time"
 import type { Annotation, TimelineClip, TimelineMarker, ToolId, VideoInfo } from "@/lib/editor-types"
 import type { ExportSettings } from "@/types/export"
-import type { OpenMediaResult, TimelineThumbnail } from "@/types/media"
+import type { OpenMediaResult } from "@/types/media"
 
 const EMPTY_VIDEO_INFO: VideoInfo = {
   filename: "No media selected",
@@ -42,6 +44,7 @@ const EMPTY_VIDEO_INFO: VideoInfo = {
 const INITIAL_ANNOTATIONS: Annotation[] = []
 
 const INITIAL_MARKERS: TimelineMarker[] = []
+const PLAYBACK_SPEEDS = [0.25, 0.5, 1, 1.5, 2] as const
 const DEFAULT_EXPORT_SETTINGS: ExportSettings = {
   format: "mp4",
   mode: "stream-copy",
@@ -77,6 +80,10 @@ function cloneMarkers(markers: TimelineMarker[]) {
 
 function cloneClips(clips: TimelineClip[]) {
   return clips.map((clip) => ({ ...clip }))
+}
+
+function numberClipLabels(clips: TimelineClip[]) {
+  return clips.map((clip, index) => ({ ...clip, label: `Clip ${index + 1}` }))
 }
 
 function normalizeFps(fps: number | undefined) {
@@ -115,20 +122,16 @@ function App() {
   const [mediaDetails, setMediaDetails] = useState<VideoInfo>(EMPTY_VIDEO_INFO)
   const [inspectorOpen, setInspectorOpen] = useState(true)
   const [timelineVisible, setTimelineVisible] = useState(true)
-  const [timelineThumbnails, setTimelineThumbnails] = useState<TimelineThumbnail[]>([])
-  const [audioWaveformPeaks, setAudioWaveformPeaks] = useState<number[]>([])
   const [videoCacheId, setVideoCacheId] = useState<string | null>(null)
   const [thumbnailCacheDir, setThumbnailCacheDir] = useState<string | null>(null)
   const [recentMediaPath, setRecentMediaPath] = useState<string | null>(null)
   const [exportSettingsOpen, setExportSettingsOpen] = useState(false)
   const [exportSettings, setExportSettings] = useState<ExportSettings>(DEFAULT_EXPORT_SETTINGS)
   const [exportScope, setExportScope] = useState<"selected" | "all">("selected")
-  const thumbnailRequestRef = useRef(0)
-  const thumbnailPendingRef = useRef(false)
-  const waveformRequestRef = useRef(0)
   const undoStackRef = useRef<ProjectSnapshot[]>([])
   const redoStackRef = useRef<ProjectSnapshot[]>([])
   const annotationClipboardRef = useRef<Annotation | null>(null)
+  const lastPressureRef = useRef<string | null>(null)
   const [historyVersion, setHistoryVersion] = useState(0)
 
   const [annotations, setAnnotations] = useState<Annotation[]>(INITIAL_ANNOTATIONS)
@@ -138,6 +141,7 @@ function App() {
   const [selectedClipIds, setSelectedClipIds] = useState<string[]>([])
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [pxPerSecond, setPxPerSecond] = useState(14)
+  const [seekRevision, setSeekRevision] = useState(0)
 
   const originalPath = useMediaStore((state) => state.originalPath)
   const playbackUrl = useMediaStore((state) => state.playbackUrl)
@@ -166,6 +170,7 @@ function App() {
   const setExportProgress = useMediaStore((state) => state.setExportProgress)
   const setExportStatus = useMediaStore((state) => state.setExportStatus)
   const setError = useMediaStore((state) => state.setError)
+  const setPerformanceConfig = usePerformanceStore((state) => state.setConfig)
 
   const mediaService = getMediaService()
   const hasMedia = Boolean(originalPath && playbackUrl)
@@ -180,7 +185,53 @@ function App() {
     duration: effectiveDuration,
   }
 
+  useEffect(() => {
+    void mediaService.setMediaPlaybackState(isPlaying).catch(() => undefined)
+  }, [isPlaying, mediaService])
+
+  useEffect(() => {
+    void mediaService
+      .getRuntimePerformanceConfig()
+      .then((config) => {
+        setPerformanceConfig(config)
+        if (import.meta.env.DEV) console.info("[media-resources:init]", config)
+      })
+      .catch(() => undefined)
+  }, [mediaService, setPerformanceConfig])
+
+  const handlePerformanceMetrics = useCallback(
+    (metrics: { droppedFrameRatio: number; userActive: boolean; windowVisible: boolean }) => {
+      void mediaService
+        .updateRuntimeMetrics(metrics)
+        .then((config) => {
+          setPerformanceConfig(config)
+          if (import.meta.env.DEV && lastPressureRef.current !== config.pressure) {
+            lastPressureRef.current = config.pressure
+            console.info("[media-resources:pressure]", config)
+          }
+        })
+        .catch(() => undefined)
+    },
+    [mediaService, setPerformanceConfig],
+  )
+
   const fileNameFromPath = useCallback((path: string) => path.split(/[\\/]/).pop() || path, [])
+
+  const synchronizePlaybackTime = useCallback(
+    (time: number) => {
+      playbackClock.set(time)
+      setCurrentTime(time)
+    },
+    [setCurrentTime],
+  )
+
+  const handleUserSeek = useCallback(
+    (time: number) => {
+      synchronizePlaybackTime(time)
+      setSeekRevision((revision) => revision + 1)
+    },
+    [synchronizePlaybackTime],
+  )
 
   const createSnapshot = useCallback(
     (): ProjectSnapshot => ({
@@ -252,43 +303,12 @@ function App() {
     setHistoryVersion((version) => version + 1)
   }, [applySnapshot, createSnapshot])
 
-  const generateTimelineThumbnails = useCallback(
-    async (inputPath: string, mediaDuration: number) => {
-      const requestId = thumbnailRequestRef.current + 1
-      thumbnailRequestRef.current = requestId
-      thumbnailPendingRef.current = true
-      setTimelineThumbnails([])
-
-      if (mediaDuration <= 0 || !Number.isFinite(mediaDuration)) {
-        thumbnailPendingRef.current = false
-        return
-      }
-
-      try {
-        const thumbnails = await mediaService.generateTimelineThumbnails(inputPath, mediaDuration)
-        if (thumbnailRequestRef.current === requestId) {
-          setTimelineThumbnails(thumbnails)
-        }
-      } catch {
-        if (thumbnailRequestRef.current === requestId) {
-          setTimelineThumbnails([])
-        }
-      } finally {
-        if (thumbnailRequestRef.current === requestId) {
-          thumbnailPendingRef.current = false
-        }
-      }
-    },
-    [mediaService],
-  )
-
   const applyMedia = useCallback(
     (media: OpenMediaResult, project?: ProjectFile) => {
-      setTimelineThumbnails([])
-      setAudioWaveformPeaks([])
       setVideoCacheId(null)
       setThumbnailCacheDir(null)
       loadMedia(media)
+      playbackClock.set(0)
       setMediaDetails({
         ...EMPTY_VIDEO_INFO,
         filename: media.fileName,
@@ -308,7 +328,7 @@ function App() {
         startTime: 0,
         endTime: media.probe.duration,
       }
-      const restoredClips = project?.clips?.length ? cloneClips(project.clips) : [initialClip]
+      const restoredClips = project?.clips?.length ? numberClipLabels(project.clips) : [initialClip]
       const selectedClipIds = project?.selectedClipIds?.filter((id) =>
         restoredClips.some((clip) => clip.id === id),
       )
@@ -338,50 +358,9 @@ function App() {
         .createVideoCacheId(media.originalPath)
         .then(setVideoCacheId)
         .catch(() => setVideoCacheId(`video-${Date.now()}`))
-      void generateTimelineThumbnails(media.originalPath, media.probe.duration)
     },
-    [generateTimelineThumbnails, loadMedia, mediaService, setPlaybackRate, setVolume],
+    [loadMedia, mediaService, setPlaybackRate, setVolume],
   )
-
-  useEffect(() => {
-    waveformRequestRef.current += 1
-    const requestId = waveformRequestRef.current
-
-    if (
-      !originalPath ||
-      !videoCacheId ||
-      effectiveDuration <= 0 ||
-      mediaDetails.audioStreams === "None"
-    ) {
-      setAudioWaveformPeaks([])
-      return
-    }
-
-    const peakCount = Math.round(Math.min(6_000, Math.max(400, effectiveDuration * 8)))
-    const timeout = window.setTimeout(() => {
-      void mediaService
-        .generateAudioWaveform({
-          videoId: videoCacheId,
-          filePath: originalPath,
-          duration: effectiveDuration,
-          peakCount,
-        })
-        .then((waveform) => {
-          if (waveformRequestRef.current === requestId && waveform.videoId === videoCacheId) {
-            setAudioWaveformPeaks(waveform.peaks)
-          }
-        })
-        .catch(() => {
-          if (waveformRequestRef.current === requestId) {
-            setAudioWaveformPeaks([])
-          }
-        })
-    }, 350)
-
-    return () => {
-      window.clearTimeout(timeout)
-    }
-  }, [effectiveDuration, mediaDetails.audioStreams, mediaService, originalPath, videoCacheId])
 
   const addMarker = useCallback(() => {
     if (!hasMedia) return
@@ -442,13 +421,9 @@ function App() {
 
   const handleNewProject = useCallback(async () => {
     if (playbackUrl) await mediaService.closeMedia(playbackUrl)
-    thumbnailRequestRef.current += 1
-    waveformRequestRef.current += 1
-    thumbnailPendingRef.current = false
     closeMedia()
+    playbackClock.set(0)
     setMediaDetails(EMPTY_VIDEO_INFO)
-    setTimelineThumbnails([])
-    setAudioWaveformPeaks([])
     setVideoCacheId(null)
     setThumbnailCacheDir(null)
     setAnnotations([])
@@ -621,11 +596,8 @@ function App() {
         )
       })
 
-      if (originalPath && timelineThumbnails.length === 0 && !thumbnailPendingRef.current) {
-        void generateTimelineThumbnails(originalPath, metadata.duration)
-      }
     },
-    [generateTimelineThumbnails, originalPath, setDuration, timelineThumbnails.length],
+    [setDuration],
   )
 
   const selected = annotations.find((a) => a.id === selectedId) ?? null
@@ -722,22 +694,21 @@ function App() {
     pushHistory()
     const nextClipId = `clip-${Date.now()}`
     setClips((prev) =>
-      prev.flatMap((clip) => {
+      numberClipLabels(prev.flatMap((clip) => {
         if (clip.id !== selectedClip.id) return [clip]
         return [
           {
             ...clip,
-            label: `${clip.label} A`,
             endTime: currentTime,
           },
           {
             id: nextClipId,
-            label: `${clip.label} B`,
+            label: clip.label,
             startTime: currentTime,
             endTime: clip.endTime,
           },
         ]
-      }),
+      })),
     )
     setSelectedClipId(nextClipId)
     setSelectedClipIds([nextClipId])
@@ -750,7 +721,7 @@ function App() {
 
     pushHistory()
     setClips((prev) => {
-      const next = prev.filter((clip) => !selectedIds.includes(clip.id))
+      const next = numberClipLabels(prev.filter((clip) => !selectedIds.includes(clip.id)))
       setSelectedClipId(next[0]?.id ?? null)
       setSelectedClipIds(next[0] ? [next[0].id] : [])
       return next
@@ -860,6 +831,7 @@ function App() {
       setError(toMediaServiceError(error))
     }
   }, [
+    annotations,
     mediaService,
     originalPath,
     exportSettings,
@@ -989,9 +961,31 @@ function App() {
         return
       }
 
-      if (event.key === "Delete" && selectedId) {
+      if (event.key === "Delete") {
+        if (selectedId) {
+          event.preventDefault()
+          deleteSelected()
+          return
+        }
+        if (selectedClipId) {
+          event.preventDefault()
+          deleteSelectedClip()
+          return
+        }
+      }
+
+      if (hasMedia && primary && (event.key === "ArrowLeft" || event.key === "ArrowRight")) {
         event.preventDefault()
-        deleteSelected()
+        const currentIndex = PLAYBACK_SPEEDS.findIndex((speed) => speed === playbackRate)
+        const fallbackIndex = PLAYBACK_SPEEDS.reduce(
+          (best, speed, index) =>
+            Math.abs(speed - playbackRate) < Math.abs(PLAYBACK_SPEEDS[best] - playbackRate) ? index : best,
+          0,
+        )
+        const index = currentIndex >= 0 ? currentIndex : fallbackIndex
+        const direction = event.key === "ArrowRight" ? 1 : -1
+        const nextIndex = Math.max(0, Math.min(PLAYBACK_SPEEDS.length - 1, index + direction))
+        setPlaybackRate(PLAYBACK_SPEEDS[nextIndex])
         return
       }
 
@@ -1055,6 +1049,7 @@ function App() {
     copySelected,
     cutSelected,
     deleteSelected,
+    deleteSelectedClip,
     exportDisabled,
     fitZoomToScreen,
     handleExport,
@@ -1066,19 +1061,24 @@ function App() {
     hasMedia,
     isPlaying,
     pasteAnnotation,
+    playbackRate,
     redo,
     selectAllClips,
     selectedId,
+    selectedClipId,
+    setPlaybackRate,
     setPlaying,
     splitSelectedClip,
     toggleAppFullscreen,
     undo,
   ])
 
+  /* eslint-disable react-hooks/refs -- historyVersion explicitly invalidates these command-state refs. */
   const canUndo = historyVersion >= 0 && undoStackRef.current.length > 0
   const canRedo = historyVersion >= 0 && redoStackRef.current.length > 0
   const canEditSelected = Boolean(selectedId)
   const canPasteAnnotation = Boolean(annotationClipboardRef.current && hasMedia)
+  /* eslint-enable react-hooks/refs */
   const currentFrame = Math.floor(currentTime * videoInfo.fps)
   const statusLabel = exportStatus === "idle" ? "Ready" : exportStatus
   const appTitle = projectPath
@@ -1147,6 +1147,19 @@ function App() {
         onRedo={redo}
       />
       {error && <ErrorNotice error={error} onDismiss={() => setError(null)} />}
+      {isLoading && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-background/55 backdrop-blur-[2px]">
+          <div className="flex items-center gap-3 rounded-xl border border-border bg-card px-5 py-4 shadow-2xl">
+            <LoaderCircle className="size-5 animate-spin text-primary" />
+            <div>
+              <div className="text-sm font-medium text-foreground">Loading media</div>
+              <div className="text-xs text-muted-foreground">
+                Selecting file and analyzing video metadata…
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       <div className="flex min-h-0 flex-1">
         <ToolSidebar
@@ -1162,13 +1175,14 @@ function App() {
               videoInfo={videoInfo}
               playbackUrl={playbackUrl}
               currentTime={currentTime}
+              seekRevision={seekRevision}
               duration={effectiveDuration}
               isPlaying={isPlaying}
               onTogglePlay={() => setPlaying(!isPlaying)}
               onEnded={() => setPlaying(false)}
-              onSeek={(t) => setCurrentTime(t)}
+              onSeek={handleUserSeek}
               onLoadedMetadata={handleLoadedMetadata}
-              onTimeUpdate={setCurrentTime}
+              onTimeUpdate={synchronizePlaybackTime}
               zoom={zoom}
               onZoomChange={setZoom}
               playbackSpeed={String(playbackRate)}
@@ -1184,6 +1198,7 @@ function App() {
               onOpenVideo={handleOpenVideo}
               hasMedia={hasMedia}
               isLoading={isLoading}
+              onPerformanceMetrics={handlePerformanceMetrics}
             />
             {inspectorOpen ? (
               <Inspector
@@ -1208,16 +1223,14 @@ function App() {
           {hasMedia && timelineVisible && (
             <div className="h-64 shrink-0 border-t border-border">
               <Timeline
-                currentTime={currentTime}
                 duration={effectiveDuration}
                 playbackUrl={playbackUrl}
                 originalPath={originalPath}
                 videoId={videoCacheId}
-                thumbnails={timelineThumbnails}
                 mediaService={mediaService}
                 videoInfo={videoInfo}
-                audioPeaks={audioWaveformPeaks}
-                onSeek={(t) => setCurrentTime(t)}
+                isPlaying={isPlaying}
+                onSeek={handleUserSeek}
                 pxPerSecond={pxPerSecond}
                 onPxPerSecondChange={setPxPerSecond}
                 markers={markers}

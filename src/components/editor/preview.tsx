@@ -828,6 +828,7 @@ export function Preview({
     const initial = video.getVideoPlaybackQuality?.()
     let lastTotalFrames = initial?.totalVideoFrames ?? 0
     let lastDroppedFrames = initial?.droppedVideoFrames ?? 0
+    const frameSamples: Array<{ total: number; dropped: number }> = []
     const startedAt = performance.now()
     let samples = 0
     const interval = window.setInterval(() => {
@@ -837,7 +838,11 @@ export function Preview({
       const droppedDelta = Math.max(0, quality.droppedVideoFrames - lastDroppedFrames)
       lastTotalFrames = quality.totalVideoFrames
       lastDroppedFrames = quality.droppedVideoFrames
-      const droppedFrameRatio = totalDelta > 0 ? droppedDelta / totalDelta : 0
+      frameSamples.push({ total: totalDelta, dropped: droppedDelta })
+      if (frameSamples.length > 5) frameSamples.shift()
+      const rollingFrames = frameSamples.reduce((sum, sample) => sum + sample.total, 0)
+      const rollingDropped = frameSamples.reduce((sum, sample) => sum + sample.dropped, 0)
+      const droppedFrameRatio = rollingFrames > 0 ? rollingDropped / rollingFrames : 0
       onPerformanceMetrics?.({
         droppedFrameRatio,
         userActive: false,

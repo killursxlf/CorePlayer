@@ -32,11 +32,12 @@ interface PreviewProps {
   playbackUrl: string | null
   currentTime: number
   seekRevision: number
+  seekMode: "preview" | "precise"
   duration: number
   isPlaying: boolean
   onTogglePlay: () => void
   onEnded: () => void
-  onSeek: (t: number) => void
+  onSeek: (t: number, mode?: "preview" | "precise") => void
   onLoadedMetadata: (metadata: { duration: number; resolution: string }) => void
   onTimeUpdate: (currentTime: number) => void
   zoom: number
@@ -108,16 +109,22 @@ function codecContentType(codec: string) {
   return null
 }
 
-async function detectPowerEfficientDecode(videoInfo: VideoInfo) {
-  const contentType = codecContentType(videoInfo.codec)
+async function detectPowerEfficientDecode(
+  codec: string,
+  resolutionText: string,
+  bitrateText: string,
+  fps: number,
+  fpsKnown: boolean,
+) {
+  const contentType = codecContentType(codec)
   if (!contentType || !navigator.mediaCapabilities?.decodingInfo) return undefined
-  const resolution = videoInfo.resolution.match(/(\d+)\s*x\s*(\d+)/i)
-  const bitrateValue = Number.parseFloat(videoInfo.bitrate.replace(",", "."))
-  const bitrateMultiplier = /gbps/i.test(videoInfo.bitrate)
+  const resolution = resolutionText.match(/(\d+)\s*x\s*(\d+)/i)
+  const bitrateValue = Number.parseFloat(bitrateText.replace(",", "."))
+  const bitrateMultiplier = /gbps/i.test(bitrateText)
     ? 1_000_000_000
-    : /mbps/i.test(videoInfo.bitrate)
+    : /mbps/i.test(bitrateText)
       ? 1_000_000
-      : /kbps/i.test(videoInfo.bitrate)
+      : /kbps/i.test(bitrateText)
         ? 1_000
         : 1
   try {
@@ -128,7 +135,7 @@ async function detectPowerEfficientDecode(videoInfo: VideoInfo) {
         width: Number(resolution?.[1] ?? 1920),
         height: Number(resolution?.[2] ?? 1080),
         bitrate: Number.isFinite(bitrateValue) ? Math.round(bitrateValue * bitrateMultiplier) : 8_000_000,
-        framerate: videoInfo.fpsKnown ? videoInfo.fps : 30,
+        framerate: fpsKnown ? fps : 30,
       },
     })
     return result.supported && result.smooth && result.powerEfficient
@@ -505,6 +512,7 @@ export function Preview({
   playbackUrl,
   currentTime,
   seekRevision,
+  seekMode,
   duration,
   isPlaying,
   onTogglePlay,
@@ -719,13 +727,31 @@ export function Preview({
     const video = videoRef.current
     if (!video || !playbackUrl || seekRevision === 0) return
 
-    const target = Math.max(0, Math.min(currentTime, Number.isFinite(video.duration) ? video.duration : currentTime))
+    const requestedTarget = Math.max(0, currentTime)
+    const fastSeek = (video as HTMLVideoElement & { fastSeek?: (time: number) => void }).fastSeek
+    if (seekMode === "preview") {
+      if (video.readyState < HTMLMediaElement.HAVE_METADATA) return
+      const previewTarget = Math.min(
+        requestedTarget,
+        Number.isFinite(video.duration) ? video.duration : requestedTarget,
+      )
+      setSeekError(null)
+      if (typeof fastSeek === "function") {
+        fastSeek.call(video, previewTarget)
+      } else {
+        video.currentTime = previewTarget
+      }
+      return
+    }
+
     let cancelled = false
     let timeout: number | null = null
+    let beginFrame: number | null = null
     let recoveryAttempted = false
+    let waitingForMetadata = false
 
     const diagnostics = () => ({
-      target,
+      target: requestedTarget,
       seekRevision,
       readyState: video.readyState,
       networkState: video.networkState,
@@ -743,9 +769,37 @@ export function Preview({
     const finish = () => {
       if (cancelled) return
       if (timeout != null) window.clearTimeout(timeout)
+      if (beginFrame != null) {
+        cancelAnimationFrame(beginFrame)
+        beginFrame = null
+      }
       setIsSeekingMedia(false)
       setSeekError(null)
       if (isPlaying) void video.play().catch(() => undefined)
+    }
+
+    const seek = () => {
+      if (cancelled) return
+      waitingForMetadata = false
+      const target = Math.max(
+        0,
+        Math.min(requestedTarget, Number.isFinite(video.duration) ? video.duration : requestedTarget),
+      )
+      if (Math.abs(video.currentTime - target) < 0.001 && !video.seeking) {
+        finish()
+        return
+      }
+      video.currentTime = target
+      armTimeout()
+    }
+
+    const waitForMetadataOrSeek = () => {
+      if (video.readyState >= HTMLMediaElement.HAVE_METADATA) {
+        seek()
+        return
+      }
+      waitingForMetadata = true
+      video.addEventListener("loadedmetadata", seek, { once: true })
     }
 
     const armTimeout = () => {
@@ -760,11 +814,8 @@ export function Preview({
           video.load()
           const separator = playbackUrl.includes("?") ? "&" : "?"
           video.src = `${playbackUrl}${separator}sourceGeneration=${seekRevision}`
-          video.addEventListener("loadedmetadata", () => {
-            if (cancelled) return
-            video.currentTime = target
-            armTimeout()
-          }, { once: true })
+          waitingForMetadata = true
+          video.addEventListener("loadedmetadata", seek, { once: true })
           video.load()
           return
         }
@@ -773,23 +824,25 @@ export function Preview({
       }, 8_000)
     }
 
-    setIsSeekingMedia(true)
-    setSeekError(null)
+    beginFrame = requestAnimationFrame(() => {
+      if (cancelled) return
+      setIsSeekingMedia(true)
+      setSeekError(null)
+    })
     video.addEventListener("seeked", finish)
-    video.addEventListener("canplay", finish)
-    video.currentTime = target
-    armTimeout()
+    waitForMetadataOrSeek()
     if (import.meta.env.DEV) console.info("[media-seek:start]", diagnostics())
     return () => {
       cancelled = true
+      if (beginFrame != null) cancelAnimationFrame(beginFrame)
       if (timeout != null) window.clearTimeout(timeout)
+      if (waitingForMetadata) video.removeEventListener("loadedmetadata", seek)
       video.removeEventListener("seeked", finish)
-      video.removeEventListener("canplay", finish)
     }
   // currentTime and isPlaying are sampled when the explicit seek revision changes;
   // ordinary timeupdate events must not restart this state machine.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [playbackUrl, seekRevision])
+  }, [playbackUrl, seekMode, seekRevision])
 
   useEffect(() => {
     const video = videoRef.current
@@ -844,7 +897,13 @@ export function Preview({
 
   useEffect(() => {
     let cancelled = false
-    void detectPowerEfficientDecode(videoInfo).then((available) => {
+    void detectPowerEfficientDecode(
+      videoInfo.codec,
+      videoInfo.resolution,
+      videoInfo.bitrate,
+      videoInfo.fps,
+      videoInfo.fpsKnown,
+    ).then((available) => {
       if (cancelled) return
       hardwareDecodeAvailableRef.current = available
       if (available !== undefined) {
@@ -1080,7 +1139,8 @@ export function Preview({
           min={0}
           max={duration}
           step={frame}
-          onValueChange={(v) => onSeek(Array.isArray(v) ? v[0] : v)}
+          onValueChange={(v) => onSeek(Array.isArray(v) ? v[0] : v, "preview")}
+          onValueCommitted={(v) => onSeek(Array.isArray(v) ? v[0] : v, "precise")}
           aria-label="Playback position"
         />
       </div>

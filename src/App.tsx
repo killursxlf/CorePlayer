@@ -99,15 +99,15 @@ function normalizeInfoText(value: string | undefined, fallback = "Unknown") {
   return trimmed ? trimmed : fallback
 }
 
-function benefitsFromPlaybackProxy(video: VideoInfo) {
-  const codec = video.codec.toLowerCase()
-  const resolution = video.resolution.match(/(\d+)\s*x\s*(\d+)/i)
+function benefitsFromPlaybackProxy(codecName: string, resolutionText: string, bitrateText: string) {
+  const codec = codecName.toLowerCase()
+  const resolution = resolutionText.match(/(\d+)\s*x\s*(\d+)/i)
   const width = Number(resolution?.[1] ?? 0)
   const height = Number(resolution?.[2] ?? 0)
-  const bitrateValue = Number.parseFloat(video.bitrate.replace(",", "."))
-  const bitrateMbps = /gbps/i.test(video.bitrate)
+  const bitrateValue = Number.parseFloat(bitrateText.replace(",", "."))
+  const bitrateMbps = /gbps/i.test(bitrateText)
     ? bitrateValue * 1000
-    : /kbps/i.test(video.bitrate)
+    : /kbps/i.test(bitrateText)
       ? bitrateValue / 1000
       : bitrateValue
   return (
@@ -164,6 +164,10 @@ function App() {
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [pxPerSecond, setPxPerSecond] = useState(14)
   const [seekRevision, setSeekRevision] = useState(0)
+  const [seekMode, setSeekMode] = useState<"preview" | "precise">("precise")
+  const previewSeekTimerRef = useRef<number | null>(null)
+  const pendingPreviewSeekRef = useRef<number | null>(null)
+  const lastPreviewSeekAtRef = useRef(0)
 
   const originalPath = useMediaStore((state) => state.originalPath)
   const playbackUrl = useMediaStore((state) => state.playbackUrl)
@@ -243,7 +247,7 @@ function App() {
     if (
       !originalPath ||
       !videoCacheId ||
-      !benefitsFromPlaybackProxy(videoInfo) ||
+      !benefitsFromPlaybackProxy(videoInfo.codec, videoInfo.resolution, videoInfo.bitrate) ||
       performanceConfig?.hardware.hardwareDecodeAvailable !== false ||
       proxyAttemptRef.current === originalPath
     ) {
@@ -263,6 +267,7 @@ function App() {
         const resumeAt = playbackClock.getSnapshot()
         setPlaybackUrl(proxyUrl)
         setCurrentTime(resumeAt)
+        setSeekMode("precise")
         setSeekRevision((revision) => revision + 1)
         if (previousUrl) await mediaService.closeMedia(previousUrl)
       })
@@ -293,11 +298,41 @@ function App() {
   )
 
   const handleUserSeek = useCallback(
-    (time: number) => {
+    (time: number, mode: "preview" | "precise" = "precise") => {
       synchronizePlaybackTime(time)
-      setSeekRevision((revision) => revision + 1)
+      if (mode === "precise") {
+        pendingPreviewSeekRef.current = null
+        if (previewSeekTimerRef.current != null) {
+          window.clearTimeout(previewSeekTimerRef.current)
+          previewSeekTimerRef.current = null
+        }
+        setSeekMode("precise")
+        setSeekRevision((revision) => revision + 1)
+        return
+      }
+
+      pendingPreviewSeekRef.current = time
+      if (previewSeekTimerRef.current != null) return
+      const delay = Math.max(0, 60 - (performance.now() - lastPreviewSeekAtRef.current))
+      previewSeekTimerRef.current = window.setTimeout(() => {
+        previewSeekTimerRef.current = null
+        if (pendingPreviewSeekRef.current == null) return
+        pendingPreviewSeekRef.current = null
+        lastPreviewSeekAtRef.current = performance.now()
+        setSeekMode("preview")
+        setSeekRevision((revision) => revision + 1)
+      }, delay)
     },
     [synchronizePlaybackTime],
+  )
+
+  useEffect(
+    () => () => {
+      if (previewSeekTimerRef.current != null) {
+        window.clearTimeout(previewSeekTimerRef.current)
+      }
+    },
+    [],
   )
 
   const createSnapshot = useCallback(
@@ -1244,6 +1279,7 @@ function App() {
               playbackUrl={playbackUrl}
               currentTime={currentTime}
               seekRevision={seekRevision}
+              seekMode={seekMode}
               duration={effectiveDuration}
               isPlaying={isPlaying}
               onTogglePlay={() => setPlaying(!isPlaying)}

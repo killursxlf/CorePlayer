@@ -59,7 +59,7 @@ interface TimelineProps {
   mediaService: MediaService
   videoInfo: VideoInfo
   isPlaying: boolean
-  onSeek: (t: number) => void
+  onSeek: (t: number, mode?: "preview" | "precise") => void
   pxPerSecond: number
   onPxPerSecondChange: (v: number) => void
   markers: TimelineMarker[]
@@ -632,7 +632,7 @@ export function Timeline({
     (clientX: number) => {
       const time = timeFromClientX(clientX, scale.pixelsPerFrame >= 20)
       playbackClock.set(time)
-      onSeek(time)
+      onSeek(time, "preview")
     },
     [onSeek, scale.pixelsPerFrame, timeFromClientX],
   )
@@ -697,9 +697,11 @@ export function Timeline({
 
       movePlayheadFromPointer(event.clientX)
       let active = true
+      let lastScrubTime = time
       const cleanup = () => {
         if (!active) return
         active = false
+        onSeek(lastScrubTime, "precise")
         window.removeEventListener("pointermove", move)
         window.removeEventListener("pointerup", cleanup)
         window.removeEventListener("pointercancel", cleanup)
@@ -710,6 +712,7 @@ export function Timeline({
           cleanup()
           return
         }
+        lastScrubTime = timeFromClientX(moveEvent.clientX, scale.pixelsPerFrame >= 20)
         movePlayheadFromPointer(moveEvent.clientX)
       }
       window.addEventListener("pointermove", move)
@@ -720,6 +723,7 @@ export function Timeline({
     [
       annotations,
       clips,
+      onSeek,
       onSelectAnnotation,
       onSelectClip,
       range,
@@ -1027,11 +1031,13 @@ export function Timeline({
                 onPointerMove={handlePlayheadPointerMove}
                 onPointerUp={(event) => {
                   event.stopPropagation()
+                  onSeek(playbackClock.getSnapshot(), "precise")
                   if (event.currentTarget.hasPointerCapture(event.pointerId)) {
                     event.currentTarget.releasePointerCapture(event.pointerId)
                   }
                 }}
                 onPointerCancel={(event) => {
+                  onSeek(playbackClock.getSnapshot(), "precise")
                   if (event.currentTarget.hasPointerCapture(event.pointerId)) {
                     event.currentTarget.releasePointerCapture(event.pointerId)
                   }

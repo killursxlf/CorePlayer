@@ -1139,6 +1139,8 @@ pub fn generate_playback_proxy(input_path: &str, video_id: &str) -> Result<Strin
     let mut command = media_command(&ffmpeg);
     command
         .arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
         .arg("-nostdin")
         .arg("-y")
         .arg("-i")

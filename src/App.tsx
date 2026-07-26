@@ -372,6 +372,7 @@ function App() {
 
   const applyMedia = useCallback(
     (media: OpenMediaResult, project?: ProjectFile) => {
+      proxyAttemptRef.current = null
       setVideoCacheId(null)
       setThumbnailCacheDir(null)
       loadMedia(media)

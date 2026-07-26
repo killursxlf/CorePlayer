@@ -13,8 +13,8 @@ use serde::Serialize;
 use uuid::Uuid;
 
 const MAX_HEADER_BYTES: usize = 16 * 1024;
-const READ_BUFFER_BYTES: usize = 128 * 1024;
-pub const MAX_RESPONSE_RANGE_BYTES: u64 = 8 * 1024 * 1024;
+const READ_BUFFER_BYTES: usize = 256 * 1024;
+pub const MAX_RESPONSE_RANGE_BYTES: u64 = 32 * 1024 * 1024;
 
 #[derive(Clone)]
 struct MediaEntry {
@@ -127,40 +127,70 @@ fn handle_connection(
     entries: &RwLock<HashMap<String, MediaEntry>>,
     session_token: &str,
 ) -> std::io::Result<()> {
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_nodelay(true)?;
+    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
     stream.set_write_timeout(Some(Duration::from_secs(15)))?;
-    let request = read_request(&mut stream)?;
+    loop {
+        let Some(request) = read_request(&mut stream)? else {
+            return Ok(());
+        };
+        if !handle_request(&mut stream, entries, session_token, &request)? {
+            return Ok(());
+        }
+    }
+}
+
+fn handle_request(
+    stream: &mut TcpStream,
+    entries: &RwLock<HashMap<String, MediaEntry>>,
+    session_token: &str,
+    request: &str,
+) -> std::io::Result<bool> {
     let mut lines = request.split("\r\n");
     let request_line = lines.next().unwrap_or_default();
     let mut request_parts = request_line.split_whitespace();
     let method = request_parts.next().unwrap_or_default();
     let target = request_parts.next().unwrap_or_default();
+    let protocol = request_parts.next().unwrap_or_default();
     if method != "GET" && method != "HEAD" {
-        return write_simple(&mut stream, 405, "Method Not Allowed", &[("Allow", "GET, HEAD")]);
+        write_simple(stream, 405, "Method Not Allowed", &[("Allow", "GET, HEAD")])?;
+        return Ok(false);
     }
+    let headers = lines.collect::<Vec<_>>();
+    let connection_header = headers.iter().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("connection").then(|| value.trim())
+    });
+    let keep_alive = protocol == "HTTP/1.1"
+        && !connection_header.is_some_and(|value| value.eq_ignore_ascii_case("close"));
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
     let supplied_token = query.split('&').find_map(|part| part.strip_prefix("token="));
     if supplied_token != Some(session_token) {
-        return write_simple(&mut stream, 403, "Forbidden", &[]);
+        write_simple(stream, 403, "Forbidden", &[])?;
+        return Ok(false);
     }
     let Some(media_id) = path.strip_prefix("/media/").filter(|id| !id.is_empty() && !id.contains('/')) else {
-        return write_simple(&mut stream, 404, "Not Found", &[]);
+        write_simple(stream, 404, "Not Found", &[])?;
+        return Ok(false);
     };
     let entry = entries.read().ok().and_then(|registry| registry.get(media_id).cloned());
     let Some(entry) = entry else {
-        return write_simple(&mut stream, 404, "Not Found", &[]);
+        write_simple(stream, 404, "Not Found", &[])?;
+        return Ok(false);
     };
     let metadata = entry.path.metadata()?;
     if !metadata.is_file() || metadata.len() != entry.size {
-        return write_simple(&mut stream, 409, "Conflict", &[]);
+        write_simple(stream, 409, "Conflict", &[])?;
+        return Ok(false);
     }
     let current_modified = metadata.modified().ok()
         .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
         .map(|duration| duration.as_millis()).unwrap_or(0);
     if current_modified != entry.modified_ms {
-        return write_simple(&mut stream, 409, "Conflict", &[]);
+        write_simple(stream, 409, "Conflict", &[])?;
+        return Ok(false);
     }
-    let range_header = lines.find_map(|line| {
+    let range_header = headers.iter().find_map(|line| {
         let (name, value) = line.split_once(':')?;
         name.eq_ignore_ascii_case("range").then(|| value.trim())
     });
@@ -168,7 +198,8 @@ fn handle_connection(
         Ok(value) => value,
         Err(_) => {
             let header = format!("Content-Range: bytes */{}\r\n", entry.size);
-            return write_raw(&mut stream, "HTTP/1.1 416 Range Not Satisfiable\r\n", &header, &[]);
+            write_raw(stream, "HTTP/1.1 416 Range Not Satisfiable\r\n", &header, &[])?;
+            return Ok(false);
         }
     };
     let (status, start, end, content_length) = match resolved {
@@ -183,15 +214,21 @@ fn handle_connection(
         SystemTime::now().duration_since(UNIX_EPOCH).map(|value| value.as_millis()).unwrap_or(0).saturating_sub(entry.registered_ms),
     );
     let mut headers = format!(
-        "Content-Type: {}\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nCache-Control: no-store\r\nConnection: close\r\n",
-        entry.mime_type, content_length
+        "Content-Type: {}\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nCache-Control: no-store\r\nConnection: {}\r\n",
+        entry.mime_type,
+        content_length,
+        if keep_alive { "keep-alive" } else { "close" },
     );
+    if keep_alive {
+        headers.push_str("Keep-Alive: timeout=30, max=100\r\n");
+    }
     if status == 206 {
         headers.push_str(&format!("Content-Range: bytes {start}-{end}/{}\r\n", entry.size));
     }
     write!(stream, "HTTP/1.1 {} {}\r\n{}\r\n", status, if status == 206 { "Partial Content" } else { "OK" }, headers)?;
     if method == "HEAD" || content_length == 0 {
-        return stream.flush();
+        stream.flush()?;
+        return Ok(keep_alive);
     }
     let mut file = File::open(&entry.path)?;
     file.seek(SeekFrom::Start(start))?;
@@ -203,27 +240,32 @@ fn handle_connection(
         let read = file.read(&mut buffer[..requested])?;
         if read == 0 { break; }
         if stream.write_all(&buffer[..read]).is_err() {
-            return Ok(());
+            return Ok(false);
         }
         remaining = remaining.checked_sub(read as u64)
             .ok_or_else(|| std::io::Error::other("Range byte counter underflow."))?;
     }
-    Ok(())
+    stream.flush()?;
+    Ok(keep_alive)
 }
 
-fn read_request(stream: &mut TcpStream) -> std::io::Result<String> {
+fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<String>> {
     let mut bytes = Vec::with_capacity(2048);
     let mut buffer = [0_u8; 2048];
     loop {
         let read = stream.read(&mut buffer)?;
-        if read == 0 { break; }
+        if read == 0 {
+            return Ok(None);
+        }
         bytes.extend_from_slice(&buffer[..read]);
         if bytes.windows(4).any(|window| window == b"\r\n\r\n") { break; }
         if bytes.len() > MAX_HEADER_BYTES {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "HTTP headers are too large."));
         }
     }
-    String::from_utf8(bytes).map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "HTTP headers are not UTF-8."))
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "HTTP headers are not UTF-8."))
 }
 
 fn write_simple(stream: &mut TcpStream, status: u16, reason: &str, extra: &[(&str, &str)]) -> std::io::Result<()> {

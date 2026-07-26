@@ -953,7 +953,7 @@ export function Preview({
             <video
               ref={videoRef}
               className="absolute inset-0 size-full object-contain"
-              preload="metadata"
+              preload="auto"
               onLoadedMetadata={(event) =>
                 onLoadedMetadata({
                   duration: event.currentTarget.duration,

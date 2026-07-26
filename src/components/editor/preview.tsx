@@ -845,12 +845,28 @@ export function Preview({
   useEffect(() => {
     let cancelled = false
     void detectPowerEfficientDecode(videoInfo).then((available) => {
-      if (!cancelled) hardwareDecodeAvailableRef.current = available
+      if (cancelled) return
+      hardwareDecodeAvailableRef.current = available
+      if (available !== undefined) {
+        onPerformanceMetrics?.({
+          droppedFrameRatio: 0,
+          userActive: false,
+          windowVisible: document.visibilityState === "visible",
+          hardwareDecodeAvailable: available,
+        })
+      }
     })
     return () => {
       cancelled = true
     }
-  }, [videoInfo.bitrate, videoInfo.codec, videoInfo.fps, videoInfo.fpsKnown, videoInfo.resolution])
+  }, [
+    onPerformanceMetrics,
+    videoInfo.bitrate,
+    videoInfo.codec,
+    videoInfo.fps,
+    videoInfo.fpsKnown,
+    videoInfo.resolution,
+  ])
 
   useEffect(() => {
     if (!isPlaying) return

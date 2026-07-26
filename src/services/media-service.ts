@@ -27,6 +27,7 @@ export type MediaService = {
   createVideoCacheId: (inputPath: string) => MediaServiceResult<string>
   generateTimelineThumbnailRange: (request: ThumbnailRequest) => MediaServiceResult<ThumbnailResult>
   generateAudioWaveform: (request: AudioWaveformRequest) => MediaServiceResult<AudioWaveformResult>
+  generatePlaybackProxy: (inputPath: string, videoId: string) => MediaServiceResult<string>
   cancelBackgroundMedia: () => MediaServiceResult<void>
   setMediaPlaybackState: (playing: boolean) => MediaServiceResult<void>
   getHardwareProfile: () => MediaServiceResult<HardwareProfile>

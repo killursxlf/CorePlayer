@@ -67,6 +67,19 @@ pub async fn generate_audio_waveform(
 }
 
 #[tauri::command]
+pub async fn generate_playback_proxy(
+    input_path: String,
+    video_id: String,
+) -> Result<String, AppError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        ffmpeg::generate_playback_proxy(&input_path, &video_id)
+    })
+    .await
+    .map_err(|error| AppError::from(MediaError::Io(error.to_string())))?
+    .map_err(AppError::from)
+}
+
+#[tauri::command]
 pub fn cancel_background_media(
     backend: State<'_, ffmpeg::BackgroundMediaBackend>,
 ) {

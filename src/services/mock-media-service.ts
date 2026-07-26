@@ -126,6 +126,10 @@ export const mockMediaService: MediaService = {
     }
   },
 
+  async generatePlaybackProxy(inputPath: string): Promise<string> {
+    return inputPath
+  },
+
   async cancelBackgroundMedia(): Promise<void> {
     return undefined
   },

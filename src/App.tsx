@@ -99,6 +99,27 @@ function normalizeInfoText(value: string | undefined, fallback = "Unknown") {
   return trimmed ? trimmed : fallback
 }
 
+function benefitsFromPlaybackProxy(video: VideoInfo) {
+  const codec = video.codec.toLowerCase()
+  const resolution = video.resolution.match(/(\d+)\s*x\s*(\d+)/i)
+  const width = Number(resolution?.[1] ?? 0)
+  const height = Number(resolution?.[2] ?? 0)
+  const bitrateValue = Number.parseFloat(video.bitrate.replace(",", "."))
+  const bitrateMbps = /gbps/i.test(video.bitrate)
+    ? bitrateValue * 1000
+    : /kbps/i.test(video.bitrate)
+      ? bitrateValue / 1000
+      : bitrateValue
+  return (
+    width >= 3840 ||
+    height >= 2160 ||
+    codec.includes("hevc") ||
+    codec.includes("h.265") ||
+    codec.includes("av1") ||
+    (Number.isFinite(bitrateMbps) && bitrateMbps >= 35)
+  )
+}
+
 function isTextEditingTarget(target: HTMLElement | null) {
   const tagName = target?.tagName
   if (!target || target.isContentEditable || tagName === "TEXTAREA" || tagName === "SELECT") {
@@ -132,6 +153,7 @@ function App() {
   const redoStackRef = useRef<ProjectSnapshot[]>([])
   const annotationClipboardRef = useRef<Annotation | null>(null)
   const lastPressureRef = useRef<string | null>(null)
+  const proxyAttemptRef = useRef<string | null>(null)
   const [historyVersion, setHistoryVersion] = useState(0)
 
   const [annotations, setAnnotations] = useState<Annotation[]>(INITIAL_ANNOTATIONS)
@@ -160,6 +182,7 @@ function App() {
   const loadMedia = useMediaStore((state) => state.loadMedia)
   const closeMedia = useMediaStore((state) => state.closeMedia)
   const setCurrentTime = useMediaStore((state) => state.setCurrentTime)
+  const setPlaybackUrl = useMediaStore((state) => state.setPlaybackUrl)
   const setDuration = useMediaStore((state) => state.setDuration)
   const setVolume = useMediaStore((state) => state.setVolume)
   const setPlaybackRate = useMediaStore((state) => state.setPlaybackRate)
@@ -171,6 +194,7 @@ function App() {
   const setExportStatus = useMediaStore((state) => state.setExportStatus)
   const setError = useMediaStore((state) => state.setError)
   const setPerformanceConfig = usePerformanceStore((state) => state.setConfig)
+  const performanceConfig = usePerformanceStore((state) => state.config)
 
   const mediaService = getMediaService()
   const hasMedia = Boolean(originalPath && playbackUrl)
@@ -214,6 +238,49 @@ function App() {
     },
     [mediaService, setPerformanceConfig],
   )
+
+  useEffect(() => {
+    if (
+      !originalPath ||
+      !videoCacheId ||
+      !benefitsFromPlaybackProxy(videoInfo) ||
+      performanceConfig?.hardware.hardwareDecodeAvailable !== false ||
+      proxyAttemptRef.current === originalPath
+    ) {
+      return
+    }
+    proxyAttemptRef.current = originalPath
+    let cancelled = false
+    void mediaService
+      .generatePlaybackProxy(originalPath, videoCacheId)
+      .then(async (proxyPath) => {
+        const proxyUrl = await mediaService.preparePlayback(proxyPath)
+        if (cancelled || useMediaStore.getState().originalPath !== originalPath) {
+          await mediaService.closeMedia(proxyUrl)
+          return
+        }
+        const previousUrl = useMediaStore.getState().playbackUrl
+        const resumeAt = playbackClock.getSnapshot()
+        setPlaybackUrl(proxyUrl)
+        setCurrentTime(resumeAt)
+        setSeekRevision((revision) => revision + 1)
+        if (previousUrl) await mediaService.closeMedia(previousUrl)
+      })
+      .catch(() => undefined)
+    return () => {
+      cancelled = true
+    }
+  }, [
+    mediaService,
+    originalPath,
+    performanceConfig?.hardware.hardwareDecodeAvailable,
+    setCurrentTime,
+    setPlaybackUrl,
+    videoCacheId,
+    videoInfo.bitrate,
+    videoInfo.codec,
+    videoInfo.resolution,
+  ])
 
   const fileNameFromPath = useCallback((path: string) => path.split(/[\\/]/).pop() || path, [])
 

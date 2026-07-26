@@ -84,6 +84,10 @@ export const tauriMediaService: MediaService = {
     return invoke<AudioWaveformResult>("generate_audio_waveform", { request })
   },
 
+  async generatePlaybackProxy(inputPath: string, videoId: string): Promise<string> {
+    return invoke<string>("generate_playback_proxy", { inputPath, videoId })
+  },
+
   async cancelBackgroundMedia(): Promise<void> {
     await invoke("cancel_background_media")
   },

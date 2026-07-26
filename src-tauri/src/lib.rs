@@ -24,6 +24,7 @@ pub fn run() {
             commands::media::get_playback_registration_count,
             commands::media::generate_timeline_thumbnail_range,
             commands::media::generate_audio_waveform,
+            commands::media::generate_playback_proxy,
             commands::media::cancel_background_media,
             commands::media::set_media_playback_state,
             commands::media::get_hardware_profile,

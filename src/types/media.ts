@@ -111,7 +111,7 @@ export type HardwareProfile = {
   totalRamBytes?: number
   availableRamBytes?: number
   onBattery?: boolean
-  hardwareDecodeAvailable: boolean
+  hardwareDecodeAvailable?: boolean
 }
 
 export type TaskBudget = {

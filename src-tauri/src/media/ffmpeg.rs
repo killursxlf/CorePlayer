@@ -77,7 +77,7 @@ pub struct HardwareProfile {
     pub total_ram_bytes: Option<u64>,
     pub available_ram_bytes: Option<u64>,
     pub on_battery: Option<bool>,
-    pub hardware_decode_available: bool,
+    pub hardware_decode_available: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -150,7 +150,7 @@ pub struct BackgroundMediaBackend {
     pressure: Arc<Mutex<PressureState>>,
     cpu_sample: Arc<Mutex<Option<(u64, u64, u64)>>>,
     cpu_load: Arc<Mutex<Option<f64>>>,
-    hardware_decode_available: Arc<AtomicBool>,
+    hardware_decode_available: Arc<Mutex<Option<bool>>>,
 }
 
 impl BackgroundMediaBackend {
@@ -186,8 +186,9 @@ impl BackgroundMediaBackend {
 
     pub fn update_metrics(&self, metrics: RuntimeMetrics) -> Result<(), MediaError> {
         if let Some(available) = metrics.hardware_decode_available {
-            self.hardware_decode_available
-                .store(available, Ordering::Relaxed);
+            if let Ok(mut stored) = self.hardware_decode_available.lock() {
+                *stored = Some(available);
+            }
         }
         let cpu_load = sample_cpu_load(&self.cpu_sample);
         if let Ok(mut stored) = self.cpu_load.lock() {
@@ -254,7 +255,11 @@ impl BackgroundMediaBackend {
             total_ram_bytes: memory.map(|(total, _)| total),
             available_ram_bytes: memory.map(|(_, available)| available),
             on_battery: None,
-            hardware_decode_available: self.hardware_decode_available.load(Ordering::Relaxed),
+            hardware_decode_available: self
+                .hardware_decode_available
+                .lock()
+                .ok()
+                .and_then(|available| *available),
         }
     }
 
@@ -1112,6 +1117,75 @@ pub fn create_video_cache_id(input_path: &str) -> Result<String, MediaError> {
     metadata.len().hash(&mut hasher);
     modified.hash(&mut hasher);
     Ok(format!("{:016x}", hasher.finish()))
+}
+
+pub fn generate_playback_proxy(input_path: &str, video_id: &str) -> Result<String, MediaError> {
+    let input = Path::new(input_path);
+    if !input.is_file() {
+        return Err(MediaError::InputMissing);
+    }
+    let proxy_dir = std::env::temp_dir()
+        .join("video-editor-cache")
+        .join("playback-proxy");
+    fs::create_dir_all(&proxy_dir)?;
+    let output = proxy_dir.join(format!("{}.mp4", sanitize_path_segment(video_id)));
+    if output.metadata().is_ok_and(|metadata| metadata.len() > 1024) {
+        return Ok(output.to_string_lossy().to_string());
+    }
+
+    let temporary = proxy_dir.join(format!(".{}.tmp.mp4", sanitize_path_segment(video_id)));
+    let _ = fs::remove_file(&temporary);
+    let ffmpeg = ffmpeg_path()?;
+    let mut command = media_command(&ffmpeg);
+    command
+        .arg("-hide_banner")
+        .arg("-nostdin")
+        .arg("-y")
+        .arg("-i")
+        .arg(input)
+        .arg("-map")
+        .arg("0:v:0")
+        .arg("-map")
+        .arg("0:a:0?")
+        .arg("-vf")
+        .arg("scale=w='trunc(min(1280,iw)/2)*2':h=-2:flags=fast_bilinear")
+        .arg("-c:v")
+        .arg("libx264")
+        .arg("-preset")
+        .arg("veryfast")
+        .arg("-crf")
+        .arg("24")
+        .arg("-pix_fmt")
+        .arg("yuv420p")
+        .arg("-g")
+        .arg("60")
+        .arg("-c:a")
+        .arg("aac")
+        .arg("-b:a")
+        .arg("128k")
+        .arg("-movflags")
+        .arg("+faststart")
+        .arg("-threads")
+        .arg("2")
+        .arg(&temporary)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    configure_background_priority(&mut command);
+    let result = command.output().map_err(MediaError::from)?;
+    if !result.status.success() || !temporary.is_file() {
+        let _ = fs::remove_file(&temporary);
+        let details = String::from_utf8_lossy(&result.stderr).trim().to_string();
+        return Err(MediaError::Io(if details.is_empty() {
+            "FFmpeg could not generate the playback proxy.".to_string()
+        } else {
+            format!("FFmpeg could not generate the playback proxy: {details}")
+        }));
+    }
+    fs::rename(&temporary, &output)
+        .or_else(|_| fs::copy(&temporary, &output).map(|_| ()))
+        .map_err(MediaError::from)?;
+    let _ = fs::remove_file(&temporary);
+    Ok(output.to_string_lossy().to_string())
 }
 
 fn generate_single_thumbnail(

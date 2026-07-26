@@ -6,6 +6,7 @@ type MediaStoreActions = {
   loadMedia: (media: OpenMediaResult) => void
   closeMedia: () => void
   setCurrentTime: (currentTime: number) => void
+  setPlaybackUrl: (playbackUrl: string) => void
   setDuration: (duration: number) => void
   setVolume: (volume: number) => void
   setPlaybackRate: (playbackRate: number) => void
@@ -72,6 +73,7 @@ export const useMediaStore = create<MediaStore>((set, get) => ({
     const { duration } = get()
     set({ currentTime: duration > 0 ? clamp(currentTime, 0, duration) : Math.max(0, currentTime) })
   },
+  setPlaybackUrl: (playbackUrl) => set({ playbackUrl }),
 
   setDuration: (duration) =>
     set((state) => {

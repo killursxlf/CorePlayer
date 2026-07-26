@@ -118,6 +118,8 @@ pub struct RuntimeMetrics {
     pub dropped_frame_ratio: f64,
     pub user_active: bool,
     pub window_visible: bool,
+    #[serde(default)]
+    pub hardware_decode_available: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -148,6 +150,7 @@ pub struct BackgroundMediaBackend {
     pressure: Arc<Mutex<PressureState>>,
     cpu_sample: Arc<Mutex<Option<(u64, u64, u64)>>>,
     cpu_load: Arc<Mutex<Option<f64>>>,
+    hardware_decode_available: Arc<AtomicBool>,
 }
 
 impl BackgroundMediaBackend {
@@ -182,6 +185,10 @@ impl BackgroundMediaBackend {
     }
 
     pub fn update_metrics(&self, metrics: RuntimeMetrics) -> Result<(), MediaError> {
+        if let Some(available) = metrics.hardware_decode_available {
+            self.hardware_decode_available
+                .store(available, Ordering::Relaxed);
+        }
         let cpu_load = sample_cpu_load(&self.cpu_sample);
         if let Ok(mut stored) = self.cpu_load.lock() {
             *stored = cpu_load;
@@ -247,7 +254,7 @@ impl BackgroundMediaBackend {
             total_ram_bytes: memory.map(|(total, _)| total),
             available_ram_bytes: memory.map(|(_, available)| available),
             on_battery: None,
-            hardware_decode_available: false,
+            hardware_decode_available: self.hardware_decode_available.load(Ordering::Relaxed),
         }
     }
 

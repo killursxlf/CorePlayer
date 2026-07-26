@@ -146,4 +146,5 @@ export type RuntimeMetrics = {
   droppedFrameRatio: number
   userActive: boolean
   windowVisible: boolean
+  hardwareDecodeAvailable?: boolean
 }

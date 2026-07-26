@@ -27,7 +27,7 @@ import { createAppError } from "@/types/app-error"
 import { isValidTrimRange } from "@/utils/time"
 import type { Annotation, TimelineClip, TimelineMarker, ToolId, VideoInfo } from "@/lib/editor-types"
 import type { ExportSettings } from "@/types/export"
-import type { OpenMediaResult } from "@/types/media"
+import type { OpenMediaResult, RuntimeMetrics } from "@/types/media"
 
 const EMPTY_VIDEO_INFO: VideoInfo = {
   filename: "No media selected",
@@ -200,7 +200,7 @@ function App() {
   }, [mediaService, setPerformanceConfig])
 
   const handlePerformanceMetrics = useCallback(
-    (metrics: { droppedFrameRatio: number; userActive: boolean; windowVisible: boolean }) => {
+    (metrics: RuntimeMetrics) => {
       void mediaService
         .updateRuntimeMetrics(metrics)
         .then((config) => {

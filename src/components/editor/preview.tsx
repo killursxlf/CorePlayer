@@ -23,6 +23,7 @@ import { cn } from "@/lib/utils"
 import { Slider } from "@/components/ui/slider"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { playbackClock } from "@/stores/playback-clock"
+import type { RuntimeMetrics } from "@/types/media"
 
 const SPEEDS = ["0.25", "0.5", "1", "1.5", "2"]
 
@@ -53,11 +54,7 @@ interface PreviewProps {
   onOpenVideo: () => void
   hasMedia: boolean
   isLoading: boolean
-  onPerformanceMetrics?: (metrics: {
-    droppedFrameRatio: number
-    userActive: boolean
-    windowVisible: boolean
-  }) => void
+  onPerformanceMetrics?: (metrics: RuntimeMetrics) => void
 }
 
 type NormalizedPoint = { x: number; y: number }
@@ -99,6 +96,44 @@ function pointFromEvent(event: React.PointerEvent | PointerEvent, element: HTMLE
   return {
     x: Math.min(1, Math.max(0, (event.clientX - rect.left) / rect.width)),
     y: Math.min(1, Math.max(0, (event.clientY - rect.top) / rect.height)),
+  }
+}
+
+function codecContentType(codec: string) {
+  const normalized = codec.toLowerCase()
+  if (normalized.includes("hevc") || normalized.includes("h.265")) return 'video/mp4; codecs="hvc1.1.6.L93.B0"'
+  if (normalized.includes("av1")) return 'video/mp4; codecs="av01.0.05M.08"'
+  if (normalized.includes("vp9")) return 'video/webm; codecs="vp09.00.10.08"'
+  if (normalized.includes("h.264") || normalized.includes("avc")) return 'video/mp4; codecs="avc1.42E01E"'
+  return null
+}
+
+async function detectPowerEfficientDecode(videoInfo: VideoInfo) {
+  const contentType = codecContentType(videoInfo.codec)
+  if (!contentType || !navigator.mediaCapabilities?.decodingInfo) return undefined
+  const resolution = videoInfo.resolution.match(/(\d+)\s*x\s*(\d+)/i)
+  const bitrateValue = Number.parseFloat(videoInfo.bitrate.replace(",", "."))
+  const bitrateMultiplier = /gbps/i.test(videoInfo.bitrate)
+    ? 1_000_000_000
+    : /mbps/i.test(videoInfo.bitrate)
+      ? 1_000_000
+      : /kbps/i.test(videoInfo.bitrate)
+        ? 1_000
+        : 1
+  try {
+    const result = await navigator.mediaCapabilities.decodingInfo({
+      type: "file",
+      video: {
+        contentType,
+        width: Number(resolution?.[1] ?? 1920),
+        height: Number(resolution?.[2] ?? 1080),
+        bitrate: Number.isFinite(bitrateValue) ? Math.round(bitrateValue * bitrateMultiplier) : 8_000_000,
+        framerate: videoInfo.fpsKnown ? videoInfo.fps : 30,
+      },
+    })
+    return result.supported && result.smooth && result.powerEfficient
+  } catch {
+    return undefined
   }
 }
 
@@ -497,6 +532,7 @@ export function Preview({
   const previewRef = useRef<HTMLDivElement | null>(null)
   const videoSurfaceRef = useRef<HTMLDivElement | null>(null)
   const videoRef = useRef<HTMLVideoElement | null>(null)
+  const hardwareDecodeAvailableRef = useRef<boolean | undefined>(undefined)
   const lastAudibleVolumeRef = useRef(80)
   const [isFullscreen, setIsFullscreen] = useState(false)
   const [zoomOrigin, setZoomOrigin] = useState("50% 50%")
@@ -807,6 +843,16 @@ export function Preview({
   }, [playbackUrl])
 
   useEffect(() => {
+    let cancelled = false
+    void detectPowerEfficientDecode(videoInfo).then((available) => {
+      if (!cancelled) hardwareDecodeAvailableRef.current = available
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [videoInfo.bitrate, videoInfo.codec, videoInfo.fps, videoInfo.fpsKnown, videoInfo.resolution])
+
+  useEffect(() => {
     if (!isPlaying) return
     const video = videoRef.current
     if (!video) return
@@ -847,6 +893,7 @@ export function Preview({
         droppedFrameRatio,
         userActive: false,
         windowVisible: document.visibilityState === "visible",
+        hardwareDecodeAvailable: hardwareDecodeAvailableRef.current,
       })
       samples += 1
       if (import.meta.env.DEV && samples % 5 === 0) {

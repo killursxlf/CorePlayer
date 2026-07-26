@@ -9,7 +9,11 @@ use std::{
 
 use serde_json::Value;
 
-use crate::media::{binaries::ffprobe_path, errors::MediaError, models::MediaProbe};
+use crate::media::{
+    binaries::{ffprobe_path, media_command},
+    errors::MediaError,
+    models::MediaProbe,
+};
 
 pub fn validate_probe_input(input_path: &str) -> Result<(), MediaError> {
     if std::path::Path::new(input_path).is_file() {
@@ -26,7 +30,7 @@ pub fn probe_media(input_path: &str) -> Result<MediaProbe, MediaError> {
         return Ok(probe_media_fallback(input_path));
     };
 
-    let mut command = Command::new(ffprobe);
+    let mut command = media_command(ffprobe);
     command
         .arg("-v")
         .arg("error")

@@ -1,6 +1,7 @@
 use std::{
     env,
     path::{Path, PathBuf},
+    process::Command,
 };
 
 use crate::media::errors::MediaError;
@@ -12,6 +13,22 @@ pub fn ffmpeg_path() -> Result<PathBuf, MediaError> {
 pub fn ffprobe_path() -> Result<PathBuf, MediaError> {
     resolve_binary("ffprobe", "FFPROBE_PATH")
 }
+
+pub fn media_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut command = Command::new(program);
+    hide_console_window(&mut command);
+    command
+}
+
+#[cfg(windows)]
+fn hide_console_window(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn hide_console_window(_command: &mut Command) {}
 
 fn resolve_binary(name: &str, env_var: &str) -> Result<PathBuf, MediaError> {
     let exe_names = binary_names(name);

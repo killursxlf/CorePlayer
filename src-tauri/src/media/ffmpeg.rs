@@ -17,7 +17,7 @@ use tauri::{AppHandle, Emitter};
 use serde::{Deserialize, Serialize};
 
 use crate::media::{
-    binaries::ffmpeg_path,
+    binaries::{ffmpeg_path, media_command},
     errors::MediaError,
     models::{
         AudioCodec, AudioWaveformRequest, AudioWaveformResult, ExportAnnotation,
@@ -803,7 +803,7 @@ pub fn generate_audio_waveform(
     }
 
     let ffmpeg = ffmpeg_path()?;
-    let mut command = Command::new(ffmpeg);
+    let mut command = media_command(ffmpeg);
     command.arg("-hide_banner")
         .arg("-nostdin")
         .arg("-v")
@@ -1126,7 +1126,7 @@ fn generate_single_thumbnail(
     ));
     let ffmpeg = ffmpeg_path()?;
     let threads = backend.thumbnail_threads();
-    let mut command = Command::new(&ffmpeg);
+    let mut command = media_command(&ffmpeg);
     command
         .arg("-hide_banner")
         .arg("-loglevel")
@@ -1189,7 +1189,7 @@ fn generate_thumbnail_chunk(
 
     let ffmpeg = ffmpeg_path()?;
     let threads = backend.thumbnail_threads();
-    let mut command = Command::new(&ffmpeg);
+    let mut command = media_command(&ffmpeg);
     command.arg("-hide_banner")
         .arg("-nostdin")
         .arg("-y")
@@ -1297,7 +1297,8 @@ fn run_background_status(
 fn configure_background_priority(command: &mut Command) {
     use std::os::windows::process::CommandExt;
     const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
-    command.creation_flags(BELOW_NORMAL_PRIORITY_CLASS);
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command.creation_flags(BELOW_NORMAL_PRIORITY_CLASS | CREATE_NO_WINDOW);
 }
 
 #[cfg(not(windows))]
@@ -1459,7 +1460,7 @@ fn build_export_command(
     annotations: &[ExportAnnotation],
     threads: usize,
 ) -> Command {
-    let mut command = Command::new(ffmpeg);
+    let mut command = media_command(ffmpeg);
     command
         .arg("-hide_banner")
         .arg("-nostdin")

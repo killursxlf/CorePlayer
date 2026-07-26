@@ -22,6 +22,7 @@ struct MediaEntry {
     size: u64,
     modified_ms: u128,
     mime_type: String,
+    #[cfg_attr(not(debug_assertions), allow(dead_code))]
     registered_ms: u128,
 }
 

@@ -20,8 +20,6 @@ pub enum MediaError {
     },
     #[error("Export is already running.")]
     ExportAlreadyRunning,
-    #[error("Export operation was not found.")]
-    OperationNotFound,
     #[error("I/O error: {0}")]
     Io(String),
 }
@@ -89,13 +87,6 @@ impl From<MediaError> for AppError {
                 title: "Export already running",
                 message:
                     "Wait for the current export to finish or cancel it before starting another.",
-                technical_details: None,
-                recoverable: true,
-            },
-            MediaError::OperationNotFound => AppError {
-                code: "OPERATION_NOT_FOUND",
-                title: "Export operation was not found",
-                message: "The export may have already finished or been cancelled.",
                 technical_details: None,
                 recoverable: true,
             },

@@ -13,8 +13,8 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use tauri::{AppHandle, Emitter};
 use serde::{Deserialize, Serialize};
+use tauri::{AppHandle, Emitter};
 
 use crate::media::{
     binaries::{ffmpeg_path, media_command},
@@ -27,8 +27,11 @@ use crate::media::{
     },
 };
 
-const ASS_PLAY_RES_X: f64 = 1920.0;
-const ASS_PLAY_RES_Y: f64 = 1080.0;
+const ASS_PLAY_RES_X: f64 = 960.0;
+const ASS_PLAY_RES_Y: f64 = 540.0;
+
+#[path = "timeline_export.rs"]
+mod timeline_export;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -77,6 +80,7 @@ pub struct HardwareProfile {
     pub total_ram_bytes: Option<u64>,
     pub available_ram_bytes: Option<u64>,
     pub on_battery: Option<bool>,
+    pub battery_saver: Option<bool>,
     pub hardware_decode_available: Option<bool>,
 }
 
@@ -100,6 +104,8 @@ pub struct TaskBudget {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimePerformanceConfig {
+    pub acceleration: super::acceleration::Status,
+    pub playback_proxy: Option<PlaybackProxyProgress>,
     pub hardware: HardwareProfile,
     pub preset: PerformancePreset,
     pub pressure: PressureLevel,
@@ -110,6 +116,13 @@ pub struct RuntimePerformanceConfig {
     pub active_background_tasks: usize,
     pub thumbnail_budget: TaskBudget,
     pub waveform_budget: TaskBudget,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaybackProxyProgress {
+    pub video_id: String,
+    pub progress: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -127,6 +140,7 @@ struct PressureState {
     level: PressureLevel,
     stable_samples: u8,
     dropped_frame_ratio: f64,
+    ui_long_task_ratio: f64,
 }
 
 impl Default for PressureState {
@@ -135,34 +149,63 @@ impl Default for PressureState {
             level: PressureLevel::Normal,
             stable_samples: 0,
             dropped_frame_ratio: 0.0,
+            ui_long_task_ratio: 0.0,
         }
     }
 }
 
 #[derive(Clone, Default)]
 pub struct BackgroundMediaBackend {
+    pub acceleration: super::acceleration::Acceleration,
     epoch: Arc<AtomicU64>,
+    proxy_epoch: Arc<AtomicU64>,
+    proxy_lock: Arc<Mutex<()>>,
     decoder_lock: Arc<Mutex<()>>,
+    waveform_lock: Arc<Mutex<()>>,
+    waveform_epoch: Arc<AtomicU64>,
+    window_hidden: Arc<AtomicBool>,
     playing: Arc<AtomicBool>,
     exporting: Arc<AtomicBool>,
     active_tasks: Arc<AtomicU64>,
     preset: Arc<Mutex<PerformancePreset>>,
     pressure: Arc<Mutex<PressureState>>,
-    cpu_sample: Arc<Mutex<Option<(u64, u64, u64)>>>,
+    cpu_sample: Arc<Mutex<Option<(u64, u64, u64, Instant)>>>,
     cpu_load: Arc<Mutex<Option<f64>>>,
     hardware_decode_available: Arc<Mutex<Option<bool>>>,
+    proxy_progress: Arc<Mutex<Option<PlaybackProxyProgress>>>,
 }
 
 impl BackgroundMediaBackend {
+    pub fn proxy_token(&self) -> u64 {
+        self.proxy_epoch.load(Ordering::Relaxed)
+    }
+
+    pub fn cancel_proxy(&self) {
+        self.proxy_epoch.fetch_add(1, Ordering::SeqCst);
+        if let Ok(mut progress) = self.proxy_progress.lock() {
+            *progress = None;
+        }
+    }
+
     pub fn token(&self) -> u64 {
         self.epoch.load(Ordering::Relaxed)
     }
 
     pub fn cancel_all(&self) {
         self.epoch.fetch_add(1, Ordering::SeqCst);
+        self.waveform_epoch.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn cancel_thumbnails(&self) {
+        self.epoch.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn waveform_token(&self) -> u64 {
+        self.waveform_epoch.load(Ordering::Acquire)
     }
 
     pub fn set_playing(&self, playing: bool) {
+        self.acceleration.set_playing(playing);
         self.playing.store(playing, Ordering::SeqCst);
         if playing {
             self.cancel_all();
@@ -173,6 +216,7 @@ impl BackgroundMediaBackend {
         self.exporting.store(exporting, Ordering::SeqCst);
         if exporting {
             self.cancel_all();
+            self.cancel_proxy();
         }
     }
 
@@ -180,7 +224,8 @@ impl BackgroundMediaBackend {
         *self
             .preset
             .lock()
-            .map_err(|_| MediaError::Io("Performance preset lock is poisoned.".to_string()))? = preset;
+            .map_err(|_| MediaError::Io("Performance preset lock is poisoned.".to_string()))? =
+            preset;
         Ok(())
     }
 
@@ -190,29 +235,44 @@ impl BackgroundMediaBackend {
                 *stored = Some(available);
             }
         }
-        let cpu_load = sample_cpu_load(&self.cpu_sample);
-        if let Ok(mut stored) = self.cpu_load.lock() {
-            *stored = cpu_load;
-        }
+        self.window_hidden
+            .store(!metrics.window_visible, Ordering::Relaxed);
+        let sampled_load = sample_cpu_load(&self.cpu_sample);
+        let cpu_load = self
+            .cpu_load
+            .lock()
+            .map(|mut stored| {
+                if sampled_load.is_some() {
+                    *stored = sampled_load;
+                }
+                *stored
+            })
+            .unwrap_or(sampled_load);
         let available_ram = memory_status().map(|(_, available)| available);
         let mut state = self
             .pressure
             .lock()
             .map_err(|_| MediaError::Io("Pressure state lock is poisoned.".to_string()))?;
-        let ratio = metrics.dropped_frame_ratio.clamp(0.0, 1.0);
+        let ratio = if metrics.dropped_frame_ratio.is_finite() {
+            metrics.dropped_frame_ratio.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
         state.dropped_frame_ratio = ratio;
         let playback = self.playing.load(Ordering::Relaxed);
         let target = if playback && ratio >= 0.08
+            || state.ui_long_task_ratio >= 0.4
             || cpu_load.is_some_and(|load| load >= 0.95)
             || available_ram.is_some_and(|bytes| bytes < 512 * 1024 * 1024)
         {
             PressureLevel::Critical
         } else if playback && ratio >= 0.03
+            || state.ui_long_task_ratio >= 0.2
             || cpu_load.is_some_and(|load| load >= 0.80)
             || available_ram.is_some_and(|bytes| bytes < 1024 * 1024 * 1024)
         {
             PressureLevel::High
-        } else if ratio >= 0.01 || metrics.user_active {
+        } else if ratio >= 0.01 || metrics.user_active || state.ui_long_task_ratio >= 0.05 {
             PressureLevel::Elevated
         } else {
             PressureLevel::Normal
@@ -232,15 +292,18 @@ impl BackgroundMediaBackend {
         } else {
             state.stable_samples = 0;
         }
-        let _ = metrics.window_visible;
         Ok(())
     }
 
     pub fn hardware_profile(&self) -> HardwareProfile {
-        let logical_cpus = std::thread::available_parallelism()
-            .map(|value| value.get())
-            .unwrap_or(1);
+        static LOGICAL_CPUS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let logical_cpus = *LOGICAL_CPUS.get_or_init(|| {
+            std::thread::available_parallelism()
+                .map(|value| value.get())
+                .unwrap_or(1)
+        });
         let memory = memory_status();
+        let power = power_status();
         HardwareProfile {
             logical_cpus,
             power_class: if logical_cpus <= 4 {
@@ -254,7 +317,8 @@ impl BackgroundMediaBackend {
             storage_class: "conservative-unknown".to_string(),
             total_ram_bytes: memory.map(|(total, _)| total),
             available_ram_bytes: memory.map(|(_, available)| available),
-            on_battery: None,
+            on_battery: power.0,
+            battery_saver: power.1,
             hardware_decode_available: self
                 .hardware_decode_available
                 .lock()
@@ -273,8 +337,62 @@ impl BackgroundMediaBackend {
             .map(|value| value.level)
             .unwrap_or(PressureLevel::High);
         let hardware = self.hardware_profile();
-        let mut budget =
-            calculate_budget(kind, preset, pressure, playback, exporting, hardware.logical_cpus);
+        let effective_preset = if preset == PerformancePreset::Auto {
+            if hardware.on_battery == Some(true)
+                || hardware.battery_saver == Some(true)
+                || hardware.logical_cpus <= 4
+                || hardware
+                    .total_ram_bytes
+                    .is_some_and(|bytes| bytes <= 4 * 1024 * 1024 * 1024)
+            {
+                PerformancePreset::PowerSaver
+            } else if hardware.logical_cpus >= 12
+                && hardware
+                    .available_ram_bytes
+                    .is_some_and(|bytes| bytes >= 8 * 1024 * 1024 * 1024)
+            {
+                PerformancePreset::Performance
+            } else {
+                PerformancePreset::Balanced
+            }
+        } else {
+            preset
+        };
+        let mut budget = calculate_budget(
+            kind,
+            effective_preset,
+            pressure,
+            playback,
+            exporting,
+            hardware.logical_cpus,
+        );
+        if self.window_hidden.load(Ordering::Relaxed)
+            && !matches!(kind, MediaTaskKind::Export | MediaTaskKind::Proxy)
+        {
+            budget.allowed = false;
+            budget.prefetch_allowed = false;
+            budget.reason = "window-hidden".into();
+        }
+        // One audio worker may run beside the video worker when there is headroom.
+        if matches!(
+            kind,
+            MediaTaskKind::VisibleWaveform | MediaTaskKind::FullWaveform
+        ) {
+            budget.max_parallel_jobs = if hardware.logical_cpus >= 8
+                && hardware
+                    .available_ram_bytes
+                    .is_some_and(|bytes| bytes >= 3 * 1024 * 1024 * 1024)
+                && effective_preset != PerformancePreset::PowerSaver
+                && pressure == PressureLevel::Normal
+                && !playback
+                && !exporting
+            {
+                2
+            } else {
+                1
+            };
+            budget.max_chunk_seconds = 30.0;
+        }
         if let Some(available) = hardware.available_ram_bytes {
             if available < 1024 * 1024 * 1024 {
                 budget.ram_cache_bytes = 32 * 1024 * 1024;
@@ -295,6 +413,12 @@ impl BackgroundMediaBackend {
             .map(|value| (value.level, value.dropped_frame_ratio))
             .unwrap_or((PressureLevel::High, 0.0));
         RuntimePerformanceConfig {
+            acceleration: self.acceleration.status(),
+            playback_proxy: self
+                .proxy_progress
+                .lock()
+                .ok()
+                .and_then(|value| value.clone()),
             hardware: self.hardware_profile(),
             preset: self.preset.lock().map(|value| *value).unwrap_or_default(),
             pressure,
@@ -312,6 +436,14 @@ impl BackgroundMediaBackend {
         self.epoch.load(Ordering::Relaxed) == token
     }
 
+    pub fn update_ui_load(&self, ratio: Option<f64>) {
+        if let Some(ratio) = ratio.filter(|value| value.is_finite()) {
+            if let Ok(mut state) = self.pressure.lock() {
+                state.ui_long_task_ratio = ratio.clamp(0.0, 1.0);
+            }
+        }
+    }
+
     fn thumbnail_threads(&self) -> usize {
         self.budget(MediaTaskKind::VisibleThumbnail).cpu_threads
     }
@@ -324,6 +456,39 @@ fn pressure_rank(level: PressureLevel) -> u8 {
         PressureLevel::High => 2,
         PressureLevel::Critical => 3,
     }
+}
+
+#[cfg(windows)]
+fn power_status() -> (Option<bool>, Option<bool>) {
+    #[repr(C)]
+    #[derive(Default)]
+    struct SystemPowerStatus {
+        ac_line_status: u8,
+        battery_flag: u8,
+        battery_percent: u8,
+        battery_saver: u8,
+        battery_life_time: u32,
+        battery_full_life_time: u32,
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetSystemPowerStatus(status: *mut SystemPowerStatus) -> i32;
+    }
+    let mut status = SystemPowerStatus::default();
+    if unsafe { GetSystemPowerStatus(&mut status) } == 0 {
+        return (None, None);
+    }
+    let battery = match status.ac_line_status {
+        0 => Some(true),
+        1 => Some(false),
+        _ => None,
+    };
+    (battery, Some(status.battery_saver == 1))
+}
+
+#[cfg(not(windows))]
+fn power_status() -> (Option<bool>, Option<bool>) {
+    (None, None)
 }
 
 fn pressure_step_down(level: PressureLevel) -> PressureLevel {
@@ -374,7 +539,11 @@ fn memory_status() -> Option<(u64, u64)> {
 }
 
 #[cfg(windows)]
-fn sample_cpu_load(sample: &Mutex<Option<(u64, u64, u64)>>) -> Option<f64> {
+fn sample_cpu_load(sample: &Mutex<Option<(u64, u64, u64, Instant)>>) -> Option<f64> {
+    let mut previous = sample.lock().ok()?;
+    if previous.is_some_and(|last| last.3.elapsed() < Duration::from_millis(500)) {
+        return None;
+    }
     #[repr(C)]
     struct FileTime {
         low: u32,
@@ -394,21 +563,18 @@ fn sample_cpu_load(sample: &Mutex<Option<(u64, u64, u64)>>) -> Option<f64> {
     if unsafe { GetSystemTimes(&mut idle, &mut kernel, &mut user) } == 0 {
         return None;
     }
-    let current = (value(&idle), value(&kernel), value(&user));
-    let mut previous = sample.lock().ok()?;
+    let current = (value(&idle), value(&kernel), value(&user), Instant::now());
     let result = previous.and_then(|last| {
         let idle_delta = current.0.saturating_sub(last.0);
         let total_delta = current.1.saturating_sub(last.1) + current.2.saturating_sub(last.2);
-        (total_delta > 0).then_some(
-            (1.0 - idle_delta as f64 / total_delta as f64).clamp(0.0, 1.0),
-        )
+        (total_delta > 0).then_some((1.0 - idle_delta as f64 / total_delta as f64).clamp(0.0, 1.0))
     });
     *previous = Some(current);
     result
 }
 
 #[cfg(not(windows))]
-fn sample_cpu_load(_sample: &Mutex<Option<(u64, u64, u64)>>) -> Option<f64> {
+fn sample_cpu_load(_sample: &Mutex<Option<(u64, u64, u64, Instant)>>) -> Option<f64> {
     None
 }
 
@@ -420,7 +586,13 @@ fn calculate_budget(
     exporting: bool,
     logical_cpus: usize,
 ) -> TaskBudget {
-    let system_class_threads = if logical_cpus <= 4 { 1 } else if logical_cpus <= 12 { 2 } else { 3 };
+    let system_class_threads = if logical_cpus <= 4 {
+        1
+    } else if logical_cpus <= 12 {
+        2
+    } else {
+        3
+    };
     let preset_threads = match preset {
         PerformancePreset::PowerSaver => 1,
         PerformancePreset::Performance => 3,
@@ -462,7 +634,12 @@ fn calculate_budget(
     );
     let mut allowed = true;
     let mut reason = "granted".to_string();
-    if exporting && !matches!(kind, MediaTaskKind::Export | MediaTaskKind::VisibleThumbnail) {
+    if exporting
+        && !matches!(
+            kind,
+            MediaTaskKind::Export | MediaTaskKind::VisibleThumbnail
+        )
+    {
         allowed = false;
         reason = "export-active".to_string();
     }
@@ -470,7 +647,9 @@ fn calculate_budget(
         cpu_threads = 1;
         batch_size = batch_size.min(3);
         decode_concurrency = 1;
-        if low_priority || matches!(kind, MediaTaskKind::VisibleWaveform) {
+        if (low_priority && !matches!(kind, MediaTaskKind::Proxy))
+            || matches!(kind, MediaTaskKind::VisibleWaveform)
+        {
             allowed = false;
             reason = "playback-priority".to_string();
         }
@@ -499,7 +678,11 @@ fn calculate_budget(
             kind,
             MediaTaskKind::VisibleWaveform | MediaTaskKind::FullWaveform
         ) {
-            if playback { 0.0 } else { 300.0 }
+            if playback {
+                0.0
+            } else {
+                300.0
+            }
         } else if playback {
             4.0
         } else {
@@ -509,7 +692,13 @@ fn calculate_budget(
             && !exporting
             && pressure == PressureLevel::Normal
             && preset != PerformancePreset::PowerSaver,
-        delay_ms: if playback { 120 } else if pressure == PressureLevel::Elevated { 80 } else { 20 },
+        delay_ms: if playback {
+            120
+        } else if pressure == PressureLevel::Elevated {
+            80
+        } else {
+            20
+        },
         ram_cache_bytes,
         decode_concurrency,
         cancel_low_priority: matches!(pressure, PressureLevel::High | PressureLevel::Critical),
@@ -542,9 +731,10 @@ impl FfmpegBackend {
     pub fn export_trim(
         &self,
         app: AppHandle,
-        request: ExportTrimRequest,
+        mut request: ExportTrimRequest,
         resources: BackgroundMediaBackend,
     ) -> Result<ExportStarted, MediaError> {
+        if request.timeline { request.clips.sort_by(|a, b| a.start_time.total_cmp(&b.start_time)); }
         validate_request(&request)?;
 
         let mut operations = self
@@ -556,25 +746,36 @@ impl FfmpegBackend {
             return Err(MediaError::ExportAlreadyRunning);
         }
 
-        let operation_id = create_operation_id();
-        let output_path = request.output_path.clone();
-        let outputs = output_paths_for_clips(
-            &request.output_path,
-            &request.clips,
-            request.settings.format,
-        );
-        let total_duration = request
-            .clips
+        let operation_id = request
+            .operation_id
+            .clone()
+            .filter(|id| !id.is_empty())
+            .unwrap_or_else(create_operation_id);
+        let output_path =
+            with_format_extension(Path::new(&request.output_path), request.settings.format);
+        let outputs = request_output_paths(&request);
+        let temporary_outputs: Vec<String> = outputs
+            .iter()
+            .map(|path| {
+                super::atomic_file::temporary_path(Path::new(path))
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        let artifacts = ExportArtifacts(temporary_outputs.clone());
+        let timeline_clips = if request.timeline { request.clips.clone() } else { vec![] };
+        let clips = if request.timeline { vec![ExportClip { id: "timeline".into(), label: "Монтаж".into(), start_time: 0.0, end_time: request.clips.last().unwrap().end_time, source_start: None }] } else { request.clips.clone() };
+        let total_duration = clips
             .iter()
             .map(|clip| clip.end_time - clip.start_time)
             .sum::<f64>()
             .max(0.001);
 
-        let first_clip = request.clips[0].clone();
-        let first_output = outputs[0].clone();
+        let first_clip = clips[0].clone();
+        let first_output = temporary_outputs[0].clone();
         let ffmpeg = ffmpeg_path()?;
         let export_threads = resources.budget(MediaTaskKind::Export).cpu_threads.max(1);
-        let mut command = build_export_command(
+        let mut cpu_command = build_export_job(
             &ffmpeg,
             &request.input_path,
             &first_output,
@@ -582,9 +783,23 @@ impl FfmpegBackend {
             &request.settings,
             &request.annotations,
             export_threads,
-        );
+            &timeline_clips,
+        )?;
 
-        let mut child = command.spawn().map_err(|error| {
+        let mut gpu = resources.acceleration.plan(&cpu_command, "export", resources.playing.load(Ordering::Acquire), true);
+        let mut accelerated;
+        let command = if let Some(plan) = gpu.as_ref() {
+            accelerated = plan.command(&cpu_command);
+            accelerated.stdout(Stdio::null()).stderr(Stdio::piped());
+            &mut accelerated
+        } else { &mut cpu_command };
+        let spawned = command.spawn().or_else(|error| {
+            if gpu.is_none() { return Err(error); }
+            resources.acceleration.report("export", "CPU", Some(format!("GPU process failed: {error}")));
+            gpu = None;
+            cpu_command.spawn()
+        });
+        let mut child = spawned.map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
                 MediaError::FfmpegUnavailable {
                     binary: "ffmpeg".to_string(),
@@ -601,94 +816,86 @@ impl FfmpegBackend {
 
         let child_ref = Arc::new(Mutex::new(child));
         operations.insert(operation_id.clone(), child_ref.clone());
+        resources.set_exporting(true);
         drop(operations);
 
         let operations_ref = self.operations.clone();
         let cancelled_ref = self.cancelled.clone();
         let thread_operation_id = operation_id.clone();
         let input_path = request.input_path.clone();
-        let clips = request.clips.clone();
         let settings = request.settings.clone();
         let annotations = request.annotations.clone();
 
         thread::spawn(move || {
             let mut last_details = String::new();
             let mut completed_duration = 0.0;
-            let mut status = run_export_child(
-                &app,
-                &thread_operation_id,
-                stderr,
-                child_ref.clone(),
-                first_clip.end_time - first_clip.start_time,
-                completed_duration,
-                total_duration,
-                &first_clip.label,
-                &mut last_details,
-            );
-            completed_duration += first_clip.end_time - first_clip.start_time;
-
-            if status
-                .as_ref()
-                .map(|status| status.success())
-                .unwrap_or(false)
-            {
-                for (clip, output) in clips.iter().zip(outputs.iter()).skip(1) {
-                    let was_cancelled = cancelled_ref
-                        .lock()
-                        .map(|cancelled| cancelled.contains(&thread_operation_id))
-                        .unwrap_or(false);
-                    if was_cancelled {
-                        break;
+            let mut status = None;
+            let mut first_stderr = Some(stderr);
+            'clips: for (clip, output) in clips.iter().zip(&temporary_outputs) {
+                loop {
+                    if cancelled_ref.lock().map(|set| set.contains(&thread_operation_id)).unwrap_or(true) {
+                        break 'clips;
                     }
-
-                    match spawn_export_child(
-                        &ffmpeg,
-                        &input_path,
-                        output,
-                        clip,
-                        &settings,
-                        &annotations,
-                        export_threads,
-                    ) {
-                        Ok((next_child, next_stderr)) => {
-                            if let Ok(mut guard) = child_ref.lock() {
-                                *guard = next_child;
+                    let stderr = if let Some(stderr) = first_stderr.take() { stderr } else {
+                        match spawn_export_child(&ffmpeg, &input_path, output, clip, &settings, &annotations,
+                            export_threads, gpu.as_ref(), &timeline_clips) {
+                            Ok((child, stderr)) => {
+                                if let Ok(mut guard) = child_ref.lock() {
+                                    *guard = child;
+                                    if cancelled_ref.lock().map(|set| set.contains(&thread_operation_id)).unwrap_or(true) {
+                                        let _ = guard.kill();
+                                    }
+                                }
+                                stderr
                             }
-                            status = run_export_child(
-                                &app,
-                                &thread_operation_id,
-                                next_stderr,
-                                child_ref.clone(),
-                                clip.end_time - clip.start_time,
-                                completed_duration,
-                                total_duration,
-                                &clip.label,
-                                &mut last_details,
-                            );
-                            completed_duration += clip.end_time - clip.start_time;
-
-                            if !status
-                                .as_ref()
-                                .map(|status| status.success())
-                                .unwrap_or(false)
-                            {
-                                break;
+                            Err(error) => {
+                                last_details = error.to_string();
+                                if gpu.take().is_some() {
+                                    resources.acceleration.report("export", "CPU", Some(last_details.clone()));
+                                    continue;
+                                }
+                                status = None;
+                                break 'clips;
                             }
                         }
-                        Err(error) => {
-                            last_details = error.to_string();
-                            status = None;
-                            break;
-                        }
+                    };
+                    status = run_export_child(&app, &thread_operation_id, stderr, child_ref.clone(),
+                        clip.end_time - clip.start_time, completed_duration, total_duration, &clip.label,
+                        &mut last_details, gpu.is_some().then_some(&resources));
+                    if status.as_ref().is_some_and(|s| s.success()) { break; }
+                    if gpu.take().is_some() && !cancelled_ref.lock().map(|set| set.contains(&thread_operation_id)).unwrap_or(true) {
+                        resources.acceleration.report("export", "CPU", Some(format!("GPU failed; clip restarted on CPU: {last_details}")));
+                        continue;
                     }
+                    break 'clips;
                 }
+                completed_duration += clip.end_time - clip.start_time;
             }
+            drop(gpu);
 
             let was_cancelled = cancelled_ref
                 .lock()
                 .map(|mut cancelled| cancelled.remove(&thread_operation_id))
                 .unwrap_or(false);
 
+            if !was_cancelled && status.as_ref().is_some_and(|s| s.success()) {
+                for (temporary, output) in temporary_outputs.iter().zip(&outputs) {
+                    let result = if clips.len() == 1
+                        && Path::new(output) == Path::new(&request.output_path)
+                    {
+                        super::atomic_file::replace(Path::new(temporary), Path::new(output))
+                    } else {
+                        // Atomic no-clobber publication for names not confirmed by the save dialog.
+                        fs::hard_link(temporary, output).and_then(|_| fs::remove_file(temporary))
+                    };
+                    if let Err(error) = result {
+                        status = None;
+                        last_details = error.to_string();
+                        break;
+                    }
+                }
+            }
+            drop(artifacts);
             let mut final_progress = if was_cancelled { 0.0 } else { 1.0 };
             let mut status_label = if was_cancelled {
                 "cancelled".to_string()
@@ -713,9 +920,19 @@ impl FfmpegBackend {
                 }
             } else {
                 final_progress = 0.0;
-                message = "Export failed".to_string();
+                if !was_cancelled {
+                    status_label = "failed".to_string();
+                    message = format!("Export failed: {last_details}");
+                }
             }
 
+            if let Ok(mut operations) = operations_ref.lock() {
+                operations.remove(&thread_operation_id);
+                if let Ok(mut cancelled) = cancelled_ref.lock() {
+                    cancelled.remove(&thread_operation_id);
+                }
+            }
+            resources.set_exporting(false);
             let _ = app.emit(
                 "export-progress",
                 ExportProgressEvent {
@@ -725,11 +942,6 @@ impl FfmpegBackend {
                     message: Some(message),
                 },
             );
-
-            if let Ok(mut operations) = operations_ref.lock() {
-                operations.remove(&thread_operation_id);
-            }
-            resources.set_exporting(false);
         });
 
         Ok(ExportStarted {
@@ -744,207 +956,47 @@ impl FfmpegBackend {
             .lock()
             .map_err(|_| MediaError::Io("Export state lock is poisoned.".to_string()))?;
 
-        let child = operations
-            .get(&operation_id)
-            .ok_or(MediaError::OperationNotFound)?
-            .clone();
-        drop(operations);
-
+        let Some(child) = operations.get(&operation_id).cloned() else {
+            return Ok(());
+        };
         self.cancelled
             .lock()
             .map_err(|_| MediaError::Io("Export cancellation lock is poisoned.".to_string()))?
             .insert(operation_id);
+        drop(operations);
 
-        let result = child
+        let mut child = child
             .lock()
-            .map_err(|_| MediaError::Io("Export process lock is poisoned.".to_string()))?
-            .kill()
-            .map_err(MediaError::from);
-
-        result
+            .map_err(|_| MediaError::Io("Export process lock is poisoned.".to_string()))?;
+        if child.try_wait()?.is_some() {
+            return Ok(());
+        }
+        child.kill().map_err(MediaError::from)
     }
 }
+
+#[path = "waveform.rs"]
+mod waveform;
 
 pub fn generate_audio_waveform(
     request: AudioWaveformRequest,
     backend: &BackgroundMediaBackend,
     token: u64,
 ) -> Result<AudioWaveformResult, MediaError> {
-    let budget = backend.budget(MediaTaskKind::VisibleWaveform);
-    if !budget.allowed {
-        return Err(MediaError::Io(format!("Waveform deferred: {}", budget.reason)));
-    }
-    let input_path = Path::new(&request.file_path);
-    if !input_path.is_file() {
-        return Err(MediaError::InputMissing);
-    }
-
-    let start_time = request.start_time.max(0.0);
-    let duration = request.end_time - start_time;
-    if duration <= 0.0 || !duration.is_finite() {
-        return Ok(AudioWaveformResult {
-            video_id: request.video_id,
-            start_time,
-            end_time: request.end_time,
-            peaks: Vec::new(),
-        });
-    }
-
-    let peak_count = request.peak_count.clamp(1, 20_000);
-    // The UI stores one envelope value per 25 seconds. 100 Hz still gives
-    // 2,500 source samples for each value without pushing high-rate PCM
-    // through the resampler and pipe.
-    let sample_rate = 100;
-    let cache_path =
-        audio_waveform_cache_path(&request.video_id, start_time, request.end_time, peak_count, sample_rate);
-    if let Some(peaks) = read_cached_audio_peaks(&cache_path) {
-        return Ok(AudioWaveformResult {
-            video_id: request.video_id,
-            start_time,
-            end_time: request.end_time,
-            peaks,
-        });
-    }
-    let _decode_guard = backend
-        .decoder_lock
-        .lock()
-        .map_err(|_| MediaError::Io("Background decoder lock is poisoned.".to_string()))?;
-    let _active_task = ActiveTaskGuard::new(backend.active_tasks.clone());
-    if !backend.is_current(token) {
-        return Err(MediaError::Io("Background media task cancelled.".to_string()));
-    }
-
-    let ffmpeg = ffmpeg_path()?;
-    let mut command = media_command(ffmpeg);
-    command.arg("-hide_banner")
-        .arg("-nostdin")
-        .arg("-v")
-        .arg("error")
-        .arg("-threads")
-        .arg("1")
-        .arg("-filter_threads")
-        .arg("1")
-        .arg("-ss")
-        .arg(format_seconds(start_time))
-        .arg("-i")
-        .arg(&request.file_path)
-        .arg("-map")
-        .arg("0:a:0")
-        .arg("-t")
-        .arg(format_seconds(duration))
-        .arg("-vn")
-        .arg("-sn")
-        .arg("-dn")
-        .arg("-ac")
-        .arg("1")
-        .arg("-ar")
-        .arg(sample_rate.to_string())
-        .arg("-f")
-        .arg("s16le")
-        .arg("pipe:1");
-    let (status, stderr, peaks) =
-        run_waveform_stream(&mut command, backend, token, sample_rate, duration, peak_count)?;
-
-    if !status.success() {
-        let details = String::from_utf8_lossy(&stderr).trim().to_string();
-        return Err(MediaError::Io(if details.is_empty() {
-            "FFmpeg could not decode audio waveform.".to_string()
-        } else {
-            details
-        }));
-    }
-
-    write_cached_audio_peaks(&cache_path, &peaks);
-
-    Ok(AudioWaveformResult {
-        video_id: request.video_id,
-        start_time,
-        end_time: request.end_time,
-        peaks,
-    })
+    waveform::generate(request, backend, token, false)
 }
 
-fn run_waveform_stream(
-    command: &mut Command,
+pub fn generate_audio_waveform_cached(
+    request: AudioWaveformRequest,
     backend: &BackgroundMediaBackend,
     token: u64,
-    sample_rate: u32,
-    duration: f64,
-    peak_count: usize,
-) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<f32>), MediaError> {
-    configure_background_priority(command);
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = command.spawn().map_err(MediaError::from)?;
-    let mut stdout = child.stdout.take().ok_or_else(|| MediaError::Io("Missing FFmpeg stdout.".to_string()))?;
-    let mut stderr = child.stderr.take().ok_or_else(|| MediaError::Io("Missing FFmpeg stderr.".to_string()))?;
-    let samples_per_peak = ((sample_rate as f64
-        * duration
-        * ((peak_count.max(1) as f64).recip()))
-        .max(1.0)) as usize;
-    let stdout_reader = thread::spawn(move || {
-        let mut peaks = Vec::with_capacity(peak_count);
-        let mut buffer = [0_u8; 65_536];
-        let mut leftover = None;
-        let mut bucket_samples = 0_usize;
-        let mut bucket_energy = 0_f64;
-        loop {
-            let read = match stdout.read(&mut buffer) {
-                Ok(0) | Err(_) => break,
-                Ok(read) => read,
-            };
-            let mut offset = 0;
-            if let Some(low) = leftover.take() {
-                let sample = i16::from_le_bytes([low, buffer[0]]) as i32;
-                bucket_energy += (sample as f64) * (sample as f64);
-                bucket_samples += 1;
-                offset = 1;
-            }
-            while offset + 1 < read {
-                let sample = i16::from_le_bytes([buffer[offset], buffer[offset + 1]]) as i32;
-                bucket_energy += (sample as f64) * (sample as f64);
-                bucket_samples += 1;
-                offset += 2;
-                if bucket_samples >= samples_per_peak {
-                    let rms = (bucket_energy / bucket_samples as f64).sqrt() / 32_768.0;
-                    peaks.push((rms as f32 * 3.0).clamp(0.0, 1.0));
-                    bucket_samples = 0;
-                    bucket_energy = 0.0;
-                }
-            }
-            if offset < read {
-                leftover = Some(buffer[offset]);
-            }
-        }
-        if bucket_samples > 0 {
-            let rms = (bucket_energy / bucket_samples as f64).sqrt() / 32_768.0;
-            peaks.push((rms as f32 * 3.0).clamp(0.0, 1.0));
-        }
-        peaks.truncate(peak_count);
-        peaks
-    });
-    let stderr_reader = thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let _ = stderr.read_to_end(&mut bytes);
-        bytes
-    });
-    let status = loop {
-        if !backend.is_current(token) {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = stdout_reader.join();
-            let _ = stderr_reader.join();
-            return Err(MediaError::Io("Background media task cancelled.".to_string()));
-        }
-        if let Some(status) = child.try_wait().map_err(MediaError::from)? {
-            break status;
-        }
-        thread::sleep(Duration::from_millis(25));
-    };
-    Ok((
-        status,
-        stderr_reader.join().unwrap_or_default(),
-        stdout_reader.join().unwrap_or_default(),
-    ))
+    cache_only: bool,
+) -> Result<AudioWaveformResult, MediaError> {
+    if cache_only {
+        waveform::generate(request, backend, token, true)
+    } else {
+        generate_audio_waveform(request, backend, token)
+    }
 }
 
 pub fn generate_timeline_thumbnail_range(
@@ -960,14 +1012,19 @@ pub fn generate_timeline_thumbnail_range(
     };
     let budget = backend.budget(task_kind);
     if !budget.allowed {
-        return Err(MediaError::Io(format!("Thumbnail generation deferred: {}", budget.reason)));
+        return Err(MediaError::Io(format!(
+            "Thumbnail generation deferred: {}",
+            budget.reason
+        )));
     }
     let input_path = Path::new(&request.file_path);
     if !input_path.is_file() {
         return Err(MediaError::InputMissing);
     }
 
-    if request.end_time <= request.start_time
+    if !request.start_time.is_finite()
+        || !request.end_time.is_finite()
+        || request.end_time < request.start_time
         || request.interval_seconds <= 0.0
         || !request.interval_seconds.is_finite()
     {
@@ -985,7 +1042,9 @@ pub fn generate_timeline_thumbnail_range(
         .map_err(|_| MediaError::Io("Background decoder lock is poisoned.".to_string()))?;
     let _active_task = ActiveTaskGuard::new(backend.active_tasks.clone());
     if !backend.is_current(token) {
-        return Err(MediaError::Io("Background media task cancelled.".to_string()));
+        return Err(MediaError::Io(
+            "Background media task cancelled.".to_string(),
+        ));
     }
 
     let interval = request.interval_seconds.max(0.001);
@@ -995,7 +1054,7 @@ pub fn generate_timeline_thumbnail_range(
     let cache_base = cache_root
         .join("thumbnail-cache")
         .join(safe_video_id)
-        .join("v5");
+        .join("v6-cover");
     let cache_base = cache_base.join(format!("{width}x{height}"));
     fs::create_dir_all(&cache_base)?;
 
@@ -1010,7 +1069,7 @@ pub fn generate_timeline_thumbnail_range(
         time += interval;
     }
 
-    let mut chunks: HashMap<u64, Vec<f64>> = HashMap::new();
+    let mut chunks: std::collections::BTreeMap<u64, Vec<f64>> = std::collections::BTreeMap::new();
     for time in &times {
         let chunk_id = (*time / 25.0).floor().max(0.0) as u64;
         chunks.entry(chunk_id).or_default().push(*time);
@@ -1019,7 +1078,9 @@ pub fn generate_timeline_thumbnail_range(
     let mut items = Vec::new();
     for (chunk_id, chunk_times) in chunks {
         if !backend.is_current(token) {
-            return Err(MediaError::Io("Background media task cancelled.".to_string()));
+            return Err(MediaError::Io(
+                "Background media task cancelled.".to_string(),
+            ));
         }
         let chunk_dir = cache_base.join(format!("chunk-{chunk_id:08}"));
         fs::create_dir_all(&chunk_dir)?;
@@ -1034,7 +1095,9 @@ pub fn generate_timeline_thumbnail_range(
             if interval >= 2.0 {
                 for time in missing {
                     if !backend.is_current(token) {
-                        return Err(MediaError::Io("Background media task cancelled.".to_string()));
+                        return Err(MediaError::Io(
+                            "Background media task cancelled.".to_string(),
+                        ));
                     }
                     let _ = generate_single_thumbnail(
                         &request.file_path,
@@ -1119,75 +1182,196 @@ pub fn create_video_cache_id(input_path: &str) -> Result<String, MediaError> {
     Ok(format!("{:016x}", hasher.finish()))
 }
 
-pub fn generate_playback_proxy(input_path: &str, video_id: &str) -> Result<String, MediaError> {
-    let input = Path::new(input_path);
-    if !input.is_file() {
-        return Err(MediaError::InputMissing);
-    }
-    let proxy_dir = std::env::temp_dir()
-        .join("video-editor-cache")
-        .join("playback-proxy");
-    fs::create_dir_all(&proxy_dir)?;
-    let output = proxy_dir.join(format!("{}.mp4", sanitize_path_segment(video_id)));
-    if output.metadata().is_ok_and(|metadata| metadata.len() > 1024) {
-        return Ok(output.to_string_lossy().to_string());
-    }
+pub fn generate_playback_proxy(
+    input_path: &str,
+    video_id: &str,
+    backend: &BackgroundMediaBackend,
+    token: u64,
+) -> Result<String, MediaError> {
+    generate_playback_proxy_with_options(input_path, video_id, backend, token, false)
+}
 
-    let temporary = proxy_dir.join(format!(".{}.tmp.mp4", sanitize_path_segment(video_id)));
-    let _ = fs::remove_file(&temporary);
-    let ffmpeg = ffmpeg_path()?;
-    let mut command = media_command(&ffmpeg);
-    command
-        .arg("-hide_banner")
-        .arg("-loglevel")
-        .arg("error")
-        .arg("-nostdin")
-        .arg("-y")
-        .arg("-i")
-        .arg(input)
-        .arg("-map")
-        .arg("0:v:0")
-        .arg("-map")
-        .arg("0:a:0?")
-        .arg("-vf")
-        .arg("scale=w='trunc(min(1280,iw)/2)*2':h=-2:flags=fast_bilinear")
-        .arg("-c:v")
-        .arg("libx264")
-        .arg("-preset")
-        .arg("veryfast")
-        .arg("-crf")
-        .arg("24")
-        .arg("-pix_fmt")
-        .arg("yuv420p")
-        .arg("-g")
-        .arg("60")
-        .arg("-c:a")
-        .arg("aac")
-        .arg("-b:a")
-        .arg("128k")
-        .arg("-movflags")
-        .arg("+faststart")
-        .arg("-threads")
-        .arg("2")
-        .arg(&temporary)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
-    configure_background_priority(&mut command);
-    let result = command.output().map_err(MediaError::from)?;
-    if !result.status.success() || !temporary.is_file() {
-        let _ = fs::remove_file(&temporary);
-        let details = String::from_utf8_lossy(&result.stderr).trim().to_string();
-        return Err(MediaError::Io(if details.is_empty() {
-            "FFmpeg could not generate the playback proxy.".to_string()
-        } else {
-            format!("FFmpeg could not generate the playback proxy: {details}")
-        }));
+pub fn generate_playback_proxy_with_options(
+    input_path: &str,
+    video_id: &str,
+    backend: &BackgroundMediaBackend,
+    token: u64,
+    force_cpu: bool,
+) -> Result<String, MediaError> {
+    let _lock = backend
+        .proxy_lock
+        .lock()
+        .map_err(|_| MediaError::Io("Proxy lock is poisoned.".into()))?;
+    if token != backend.proxy_token() {
+        return Err(MediaError::Io("Playback proxy cancelled.".into()));
     }
-    fs::rename(&temporary, &output)
-        .or_else(|_| fs::copy(&temporary, &output).map(|_| ()))
-        .map_err(MediaError::from)?;
-    let _ = fs::remove_file(&temporary);
-    Ok(output.to_string_lossy().to_string())
+    if let Ok(mut progress) = backend.proxy_progress.lock() {
+        *progress = None;
+    }
+    let fingerprint = create_video_cache_id(input_path)?;
+    let probe = super::ffprobe::probe_media(input_path)?;
+    if probe.has_video != Some(true) {
+        return Err(MediaError::Io("This file has no video to optimize.".into()));
+    }
+    let output = super::proxy_cache::root().join(format!("{fingerprint}-{}.mp4", if force_cpu { "cpu-v3" } else { "v2" }));
+    // Cached output is validated before use; a partial/truncated file is never registered.
+    if let Ok(cached) = super::ffprobe::probe_media(&output.to_string_lossy()) {
+        if cached.has_video == Some(true) && (cached.duration - probe.duration).abs() < 0.25 {
+            return Ok(output.to_string_lossy().into_owned());
+        }
+    }
+    if token != backend.proxy_token() {
+        return Err(MediaError::Io("Playback proxy cancelled.".into()));
+    }
+    if !backend.budget(MediaTaskKind::Proxy).allowed {
+        return Err(MediaError::Io("Playback optimization is unavailable while exporting or under heavy load. Pause playback and retry.".into()));
+    }
+    super::proxy_cache::reserve_space()?;
+    let _output_lease = super::proxy_cache::Lease::new(&output);
+    let temporary = super::atomic_file::temporary_path(&output);
+    let _temporary_lease = super::proxy_cache::Lease::new(&temporary);
+    let _artifacts = ExportArtifacts(vec![temporary.to_string_lossy().into_owned()]);
+    if let Ok(mut progress) = backend.proxy_progress.lock() {
+        *progress = Some(PlaybackProxyProgress {
+            video_id: video_id.into(),
+            progress: 0.0,
+        });
+    }
+    let _active = ActiveTaskGuard::new(backend.active_tasks.clone());
+    let mut command = media_command(ffmpeg_path()?);
+    command.args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-threads", "1", "-i"])
+        .arg(input_path)
+        .args(["-filter_threads", "1", "-map", "0:V:0", "-map", "0:a:0?", "-vf",
+            "scale=w='max(2,trunc(min(1280,min(720,ih)*dar)/2)*2)':h='max(2,trunc(min(720,min(1280,iw*sar)/dar)/2)*2)':flags=fast_bilinear,setsar=1",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "24", "-pix_fmt", "yuv420p",
+            "-force_key_frames", "expr:gte(t,n_forced*0.5)", "-fps_mode", "vfr",
+            "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", "-threads", "1",
+            "-progress", "pipe:1", "-nostats", "-fs"])
+        .arg(super::proxy_cache::MAX_PROXY_BYTES.to_string())
+        .arg(&temporary).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut gpu = if force_cpu {
+        backend.acceleration.report("proxy", "CPU", Some("WebView could not play the source; preparing a compatible H.264/AAC copy on CPU".into()));
+        None
+    } else { backend.acceleration.plan(&command, "proxy", backend.playing.load(Ordering::Acquire), true) };
+    loop {
+    let mut accelerated;
+    let attempt = if let Some(plan) = gpu.as_ref() {
+        accelerated = plan.command(&command);
+        &mut accelerated
+    } else { &mut command };
+    attempt.stdout(Stdio::piped()).stderr(Stdio::piped());
+    configure_background_priority(attempt);
+    let mut child = match attempt.spawn() {
+        Ok(child) => child,
+        Err(error) if gpu.is_some() => {
+            backend.acceleration.report("proxy", "CPU", Some(format!("GPU process failed: {error}")));
+            gpu = None;
+            continue;
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let stderr = child.stderr.take().expect("piped proxy stderr");
+    let stdout = child.stdout.take().expect("piped proxy progress");
+    let reader = thread::spawn(move || {
+        let mut stderr = stderr;
+        let mut bytes = Vec::new();
+        let mut buffer = [0; 4096];
+        while let Ok(count) = stderr.read(&mut buffer) {
+            if count == 0 {
+                break;
+            }
+            let keep = count.min(65_536_usize.saturating_sub(bytes.len()));
+            bytes.extend_from_slice(&buffer[..keep]);
+        }
+        bytes
+    });
+    let progress_backend = backend.clone();
+    let duration = probe.duration;
+    let encoded_time = Arc::new(AtomicU64::new(0));
+    let progress_time = encoded_time.clone();
+    let progress_reader = thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Some(time) = line
+                .strip_prefix("out_time_us=")
+                .and_then(|value| value.parse::<f64>().ok())
+            {
+                progress_time.store(time.max(0.0) as u64, Ordering::Release);
+                if let Ok(mut progress) = progress_backend.proxy_progress.lock() {
+                    if let Some(progress) = progress.as_mut() {
+                        progress.progress = (time / 1_000_000.0 / duration).clamp(0.0, 0.99);
+                    }
+                }
+            }
+        }
+    });
+    let mut last_progress = 0;
+    let mut last_progress_at = Instant::now();
+    let result = loop {
+        if token != backend.proxy_token() {
+            break Err(MediaError::Io("Playback proxy cancelled.".into()));
+        }
+        if !backend.budget(MediaTaskKind::Proxy).allowed {
+            break Err(MediaError::Io("Playback optimization stopped to keep playback responsive. Pause playback and retry.".into()));
+        }
+        if gpu.is_some() && backend.playing.load(Ordering::Acquire) {
+            break Err(MediaError::Io("GPU released for playback; restarting proxy on CPU.".into()));
+        }
+        if gpu.is_some() {
+            let progress = encoded_time.load(Ordering::Acquire);
+            if progress > last_progress { last_progress = progress; last_progress_at = Instant::now(); }
+            if last_progress_at.elapsed() > Duration::from_secs(20) {
+                break Err(MediaError::Io("GPU proxy made no progress for 20 seconds.".into()));
+            }
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Err(error) => break Err(MediaError::from(error)),
+            Ok(None) => thread::sleep(Duration::from_millis(100)),
+        }
+    };
+    if result.is_err() {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+    let diagnostics = reader.join().unwrap_or_default();
+    let _ = progress_reader.join();
+    if gpu.is_some() && token == backend.proxy_token()
+        && backend.budget(MediaTaskKind::Proxy).allowed
+        && !result.as_ref().is_ok_and(|status| status.success()) {
+        let reason = result.as_ref().err().map(ToString::to_string).unwrap_or_else(|| String::from_utf8_lossy(&diagnostics).trim().into());
+        backend.acceleration.report("proxy", "CPU", Some(format!("GPU failed; retrying from source: {reason}")));
+        gpu = None;
+        continue;
+    }
+    if !result?.success() {
+        return Err(MediaError::Io(format!(
+            "Could not prepare playback copy: {}",
+            String::from_utf8_lossy(&diagnostics).trim()
+        )));
+    }
+    break;
+    }
+    if token != backend.proxy_token() {
+        return Err(MediaError::Io("Playback proxy cancelled.".into()));
+    }
+    let completed = super::ffprobe::probe_media(&temporary.to_string_lossy())?;
+    if (completed.duration - probe.duration).abs() >= 0.25
+        || temporary.metadata()?.len() > super::proxy_cache::MAX_PROXY_BYTES
+    {
+        return Err(MediaError::Io("The optimized copy exceeded the 2 GiB cache limit or was incomplete. The original remains available.".into()));
+    }
+    if create_video_cache_id(input_path)? != fingerprint {
+        return Err(MediaError::Io(
+            "The source changed while preparing playback.".into(),
+        ));
+    }
+    super::atomic_file::replace(&temporary, &output)?;
+    if let Ok(mut progress) = backend.proxy_progress.lock() {
+        if let Some(progress) = progress.as_mut() {
+            progress.progress = 1.0;
+        }
+    }
+    Ok(output.to_string_lossy().into_owned())
 }
 
 fn generate_single_thumbnail(
@@ -1230,16 +1414,18 @@ fn generate_single_thumbnail(
         .arg("-frames:v")
         .arg("1")
         .arg("-vf")
-        .arg(format!("scale={width}:{height}:flags=fast_bilinear"))
+        .arg(format!("scale={width}:{height}:force_original_aspect_ratio=increase:flags=fast_bilinear,crop={width}:{height},setsar=1"))
         .arg("-q:v")
         .arg("5")
         .arg(&temp)
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    let status = run_background_status(&mut command, backend, token).map_err(MediaError::from)?;
+    let status = run_thumbnail_status(&mut command, backend, token, false).map_err(MediaError::from)?;
     if !status.success() || !temp.is_file() {
         let _ = fs::remove_file(&temp);
-        return Err(MediaError::Io("FFmpeg could not generate a timeline thumbnail.".to_string()));
+        return Err(MediaError::Io(
+            "FFmpeg could not generate a timeline thumbnail.".to_string(),
+        ));
     }
     fs::rename(&temp, &target)
         .or_else(|_| fs::copy(&temp, &target).map(|_| ()))
@@ -1267,13 +1453,14 @@ fn generate_thumbnail_chunk(
 
     let pattern = temp_dir.join("frame_%05d.jpg");
     let fps = (1.0 / interval).min(60.0);
-    let filter = format!("fps={fps:.6},scale={width}:{height}:flags=fast_bilinear");
+    let filter = format!("fps={fps:.6},scale={width}:{height}:force_original_aspect_ratio=increase:flags=fast_bilinear,crop={width}:{height},setsar=1");
     let duration = (end_time - start_time).max(interval);
 
     let ffmpeg = ffmpeg_path()?;
     let threads = backend.thumbnail_threads();
     let mut command = media_command(&ffmpeg);
-    command.arg("-hide_banner")
+    command
+        .arg("-hide_banner")
         .arg("-nostdin")
         .arg("-y")
         .arg("-threads")
@@ -1296,7 +1483,7 @@ fn generate_thumbnail_chunk(
         .arg(pattern)
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    let status = run_background_status(&mut command, backend, token);
+    let status = run_thumbnail_status(&mut command, backend, token, true);
 
     match status {
         Ok(status) if status.success() => {
@@ -1344,6 +1531,29 @@ fn generate_thumbnail_chunk(
     }
 }
 
+fn run_thumbnail_status(command: &mut Command, backend: &BackgroundMediaBackend, token: u64, batch: bool)
+    -> Result<std::process::ExitStatus, std::io::Error> {
+    if let Some(plan) = backend.acceleration.plan(command, "thumbnails", backend.playing.load(Ordering::Acquire), batch) {
+        let mut gpu = plan.command(command);
+        gpu.stdout(Stdio::null()).stderr(Stdio::null());
+        let result = run_background_status(&mut gpu, backend, token);
+        if result.as_ref().is_ok_and(|status| status.success()) { return result; }
+        if !backend.is_current(token) { return result; }
+        backend.acceleration.report("thumbnails", "CPU", Some("GPU thumbnail decode failed or timed out; retrying on CPU".into()));
+        if batch {
+            if let Some(directory) = command.get_args().last().and_then(|path| Path::new(path).parent()) {
+                // Only private FFmpeg image-sequence artifacts are removed before retry.
+                for entry in fs::read_dir(directory)?.filter_map(Result::ok) {
+                    if entry.file_name().to_string_lossy().starts_with("frame_") && entry.path().extension().is_some_and(|e| e == "jpg") {
+                        fs::remove_file(entry.path())?;
+                    }
+                }
+            }
+        }
+    }
+    run_background_status(command, backend, token)
+}
+
 fn run_background_status(
     command: &mut Command,
     backend: &BackgroundMediaBackend,
@@ -1387,55 +1597,6 @@ fn configure_background_priority(command: &mut Command) {
 #[cfg(not(windows))]
 fn configure_background_priority(_command: &mut Command) {}
 
-fn audio_waveform_cache_path(
-    video_id: &str,
-    start_time: f64,
-    end_time: f64,
-    peak_count: usize,
-    sample_rate: u32,
-) -> PathBuf {
-    let start_ms = (start_time.max(0.0) * 1000.0).round() as u64;
-    let end_ms = (end_time.max(start_time) * 1000.0).round() as u64;
-    std::env::temp_dir()
-        .join("video-editor-cache")
-        .join("waveform-cache")
-        .join(sanitize_path_segment(video_id))
-        .join(format!(
-            "v4-rms-s{start_ms}-e{end_ms}-p{peak_count}-r{sample_rate}.f32"
-        ))
-}
-
-fn read_cached_audio_peaks(path: &Path) -> Option<Vec<f32>> {
-    let bytes = fs::read(path).ok()?;
-    if bytes.is_empty() || bytes.len() % 4 != 0 {
-        return None;
-    }
-
-    Some(
-        bytes
-            .chunks_exact(4)
-            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-            .filter(|peak| peak.is_finite())
-            .map(|peak| peak.clamp(0.0, 1.0))
-            .collect(),
-    )
-}
-
-fn write_cached_audio_peaks(path: &Path, peaks: &[f32]) {
-    let Some(parent) = path.parent() else {
-        return;
-    };
-    if fs::create_dir_all(parent).is_err() {
-        return;
-    }
-
-    let mut bytes = Vec::with_capacity(peaks.len() * 4);
-    for peak in peaks {
-        bytes.extend_from_slice(&peak.clamp(0.0, 1.0).to_le_bytes());
-    }
-    let _ = fs::write(path, bytes);
-}
-
 fn thumbnail_path(chunk_dir: &Path, time: f64) -> PathBuf {
     chunk_dir.join(format!("t-{:012}.jpg", (time * 1000.0).round() as u64))
 }
@@ -1476,31 +1637,103 @@ fn validate_request(request: &ExportTrimRequest) -> Result<(), MediaError> {
     }
 
     for clip in &request.clips {
-        if clip.start_time < 0.0 {
+        if clip.source_start.is_some_and(|time| !time.is_finite() || time < 0.0) {
+            return Err(MediaError::InvalidStartTime);
+        }
+        if !clip.start_time.is_finite() || clip.start_time < 0.0 {
             return Err(MediaError::InvalidStartTime);
         }
 
-        if clip.end_time <= clip.start_time {
+        if !clip.end_time.is_finite() || clip.end_time <= clip.start_time {
             return Err(MediaError::InvalidEndTime);
         }
     }
 
     let input_canonical = input_path.canonicalize()?;
-    let output_path = PathBuf::from(&request.output_path);
-    let output_parent = output_path.parent().ok_or(MediaError::EmptyOutputPath)?;
-
-    if !output_parent.exists() {
+    if request.timeline && request.clips.windows(2).any(|pair| pair[0].end_time > pair[1].start_time + 0.000001) {
+        return Err(MediaError::Io("Timeline clips must be ordered and must not overlap.".into()));
+    }
+    let outputs = request_output_paths(request);
+    let mut unique = HashSet::new();
+    for output in outputs {
+        let output_path = PathBuf::from(&output);
+        let parent = output_path.parent().ok_or(MediaError::EmptyOutputPath)?;
+        if !parent.is_dir() {
+            return Err(MediaError::Io("Output directory does not exist.".into()));
+        }
+        if normalize_path(&output_path) == input_canonical
+            || (output_path.exists() && output_path.canonicalize()? == input_canonical)
+        {
+            return Err(MediaError::SameInputOutput);
+        }
+        if !unique.insert(normalize_path(&output_path)) {
+            return Err(MediaError::Io("Export filenames must be unique.".into()));
+        }
+        if output_path.exists()
+            && ((!request.timeline && request.clips.len() > 1) || output_path != Path::new(&request.output_path))
+        {
+            return Err(MediaError::Io(format!(
+                "Output already exists: {output}. Choose a new export name."
+            )));
+        }
+    }
+    let settings = &request.settings;
+    if matches!(settings.format, ExportFormat::Webm)
+        && (matches!(settings.mode, ExportMode::StreamCopy)
+            || !matches!(settings.video_codec, VideoCodec::Vp9 | VideoCodec::Av1)
+            || settings.audio_codec != AudioCodec::Opus)
+    {
         return Err(MediaError::Io(
-            "Output directory does not exist.".to_string(),
+            "WebM requires encoding with VP9/AV1 and Opus. Use MKV to copy source streams.".into(),
         ));
     }
-
-    if output_path.exists() && output_path.canonicalize()? == input_canonical {
-        return Err(MediaError::SameInputOutput);
+    if settings
+        .fps
+        .is_some_and(|fps| !fps.is_finite() || fps <= 0.0 || fps > 240.0)
+        || settings
+            .width
+            .is_some_and(|v| v < 2 || v > 16384 || v % 2 != 0)
+        || settings
+            .height
+            .is_some_and(|v| v < 2 || v > 16384 || v % 2 != 0)
+        || settings.crf.is_some_and(|v| {
+            v > if matches!(settings.video_codec, VideoCodec::H264 | VideoCodec::H265) {
+                51
+            } else {
+                63
+            }
+        })
+    {
+        return Err(MediaError::Io(
+            "Invalid export dimensions, FPS or CRF. Dimensions must be even.".into(),
+        ));
     }
-
-    if !output_path.exists() && normalize_path(&output_path) == input_canonical {
-        return Err(MediaError::SameInputOutput);
+    if settings.video_codec == VideoCodec::Copy
+        && (settings.width.is_some() || settings.height.is_some() || settings.fps.is_some())
+        && matches!(settings.mode, ExportMode::Encode)
+    {
+        return Err(MediaError::Io(
+            "Choose a video encoder to change resolution or FPS.".into(),
+        ));
+    }
+    for clip in &request.clips {
+        let crops: Vec<_> = request
+            .annotations
+            .iter()
+            .filter(|a| {
+                a.visible
+                    && a.annotation_type == ExportAnnotationType::Crop
+                    && a.start_time < clip.end_time
+                    && a.end_time > clip.start_time
+            })
+            .collect();
+        if crops.len() > 1
+            || crops
+                .iter()
+                .any(|a| a.start_time > clip.start_time || a.end_time < clip.end_time)
+        {
+            return Err(MediaError::Io("Use one crop covering the entire exported clip; output dimensions cannot change during a clip.".into()));
+        }
     }
 
     Ok(())
@@ -1514,9 +1747,23 @@ fn spawn_export_child(
     settings: &ExportSettings,
     annotations: &[ExportAnnotation],
     threads: usize,
+    gpu: Option<&super::acceleration::Plan>,
+    timeline: &[ExportClip],
 ) -> Result<(Child, std::process::ChildStderr), MediaError> {
-    let mut command =
-        build_export_command(ffmpeg, input_path, output_path, clip, settings, annotations, threads);
+    let mut command = build_export_job(
+        ffmpeg,
+        input_path,
+        output_path,
+        clip,
+        settings,
+        annotations,
+        threads,
+        timeline,
+    )?;
+    if let Some(plan) = gpu {
+        command = plan.command(&command);
+        command.stdout(Stdio::null()).stderr(Stdio::piped());
+    }
     let mut child = command.spawn().map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             MediaError::FfmpegUnavailable {
@@ -1534,7 +1781,12 @@ fn spawn_export_child(
     Ok((child, stderr))
 }
 
-fn build_export_command(
+fn build_export_job(ffmpeg: &Path, input: &str, output: &str, clip: &ExportClip, settings: &ExportSettings, annotations: &[ExportAnnotation], threads: usize, timeline: &[ExportClip]) -> Result<Command, MediaError> {
+    if timeline.is_empty() { build_export_command(ffmpeg, input, output, clip, settings, annotations, threads) }
+    else { timeline_export::build(ffmpeg, input, output, timeline, settings, annotations, threads) }
+}
+
+pub(super) fn build_export_command(
     ffmpeg: &Path,
     input_path: &str,
     output_path: &str,
@@ -1542,41 +1794,99 @@ fn build_export_command(
     settings: &ExportSettings,
     annotations: &[ExportAnnotation],
     threads: usize,
-) -> Command {
+) -> Result<Command, MediaError> {
     let mut command = media_command(ffmpeg);
     command
-        .arg("-hide_banner")
-        .arg("-nostdin")
-        .arg("-y")
-        .arg("-ss")
-        .arg(format_seconds(clip.start_time))
-        .arg("-to")
-        .arg(format_seconds(clip.end_time))
-        .arg("-i")
-        .arg(input_path);
-
-    let overlay_path = write_clip_ass_overlay(clip, annotations).ok().flatten();
-    apply_export_settings(&mut command, settings, overlay_path.as_deref());
-
-    command
+        .args(["-hide_banner", "-nostdin", "-y", "-filter_threads", "1"])
         .arg("-threads")
         .arg(threads.clamp(1, 8).to_string())
-        .arg("-avoid_negative_ts")
-        .arg("make_zero")
-        .arg("-progress")
-        .arg("pipe:2")
+        .arg("-ss")
+        .arg(format_seconds(clip.source_start.unwrap_or(clip.start_time)))
+        .arg("-i")
+        .arg(input_path)
+        .arg("-t")
+        .arg(format_seconds(clip.end_time - clip.start_time))
+        .args(["-map", "0:V:0?", "-map", "0:a?", "-map_metadata", "0"]);
+    let overlay_path = write_clip_ass_overlay(
+        clip,
+        annotations,
+        &Path::new(output_path).with_extension("ass"),
+    )?;
+    let filters = annotation_filters(clip, annotations, overlay_path.as_deref());
+    let copies_video = filters.is_empty()
+        && (matches!(settings.mode, ExportMode::StreamCopy)
+            || settings.video_codec == VideoCodec::Copy);
+    apply_export_settings(&mut command, settings, filters);
+    command.arg("-threads").arg(threads.clamp(1, 8).to_string());
+    if copies_video {
+        command.args(["-avoid_negative_ts", "make_zero"]);
+    }
+    if matches!(settings.format, ExportFormat::Mp4 | ExportFormat::Mov) {
+        command.args(["-movflags", "+faststart"]);
+    }
+    command
+        .args(["-progress", "pipe:2"])
         .arg(output_path)
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
-    command
+    Ok(command)
+}
+
+struct ExportArtifacts(Vec<String>);
+impl Drop for ExportArtifacts {
+    fn drop(&mut self) {
+        for output in &self.0 {
+            let _ = fs::remove_file(output);
+            let _ = fs::remove_file(Path::new(output).with_extension("ass"));
+            let _ = fs::remove_file(Path::new(output).with_extension("filter"));
+            let _ = fs::remove_file(Path::new(output).with_extension("gpu.filter"));
+        }
+    }
+}
+
+fn annotation_filters(
+    clip: &ExportClip,
+    annotations: &[ExportAnnotation],
+    overlay: Option<&Path>,
+) -> Vec<String> {
+    let active: Vec<_> = annotations
+        .iter()
+        .filter(|a| a.visible && a.start_time < clip.end_time && a.end_time > clip.start_time)
+        .collect();
+    let mut filters = Vec::new();
+    for (index, a) in active
+        .iter()
+        .filter(|a| a.annotation_type == ExportAnnotationType::Blur)
+        .enumerate()
+    {
+        let x = clamp01(a.x);
+        let y = clamp01(a.y);
+        let w = a.width.clamp(0.001, (1.0 - x).max(0.001));
+        let h = a.height.clamp(0.001, (1.0 - y).max(0.001));
+        let start = (a.start_time - clip.start_time).max(0.0);
+        let end = a.end_time.min(clip.end_time) - clip.start_time;
+        let radius = (a.thickness * 2.0).clamp(4.0, 80.0);
+        let alpha = a.opacity.clamp(0.0, 100.0) / 100.0;
+        filters.push(format!("split[base{index}][region{index}];[region{index}]crop=w='max(2,trunc(iw*{w}/2)*2)':h='max(2,trunc(ih*{h}/2)*2)':x='trunc(iw*{x}/2)*2':y='trunc(ih*{y}/2)*2',boxblur=luma_radius='min({radius},min(w,h)/2)':luma_power=2:chroma_radius='min({radius},min(cw,ch)/2)',format=rgba,colorchannelmixer=aa={alpha}[blur{index}];[base{index}][blur{index}]overlay=x='trunc(main_w*{x}/2)*2':y='trunc(main_h*{y}/2)*2':enable='gte(t,{start})*lt(t,{end})'"));
+    }
+    if let Some(path) = overlay {
+        filters.push(format!("ass='{}'", escape_filter_path(path)));
+    }
+    if let Some(a) = active
+        .iter()
+        .find(|a| a.annotation_type == ExportAnnotationType::Crop)
+    {
+        filters.push(format!("crop=w='max(2,trunc(iw*{}/2)*2)':h='max(2,trunc(ih*{}/2)*2)':x='trunc(iw*{}/2)*2':y='trunc(ih*{}/2)*2'", clamp01(a.width), clamp01(a.height), clamp01(a.x), clamp01(a.y)));
+    }
+    filters
 }
 
 fn apply_export_settings(
     command: &mut Command,
     settings: &ExportSettings,
-    overlay_path: Option<&Path>,
+    mut filters: Vec<String>,
 ) {
-    let has_overlay = overlay_path.is_some();
+    let has_overlay = !filters.is_empty();
 
     if matches!(settings.mode, ExportMode::StreamCopy) && !has_overlay {
         command.arg("-c").arg("copy");
@@ -1637,7 +1947,6 @@ fn apply_export_settings(
         command.arg("-b:a").arg(format!("{kbps}k"));
     }
 
-    let mut filters = Vec::new();
     if let Some(fps) = settings
         .fps
         .filter(|value| value.is_finite() && *value > 0.0)
@@ -1656,15 +1965,11 @@ fn apply_export_settings(
         }
         _ => {}
     }
-    if !filters.is_empty() && settings.video_codec != VideoCodec::Copy {
-        if let Some(path) = overlay_path {
-            filters.push(format!("ass='{}'", escape_filter_path(path)));
-        }
+    if !filters.is_empty() {
         command.arg("-vf").arg(filters.join(","));
-    } else if let Some(path) = overlay_path {
-        command
-            .arg("-vf")
-            .arg(format!("ass='{}'", escape_filter_path(path)));
+    }
+    if settings.video_codec != VideoCodec::Copy || has_overlay {
+        command.args(["-pix_fmt", "yuv420p"]);
     }
 }
 
@@ -1694,26 +1999,22 @@ fn apply_default_overlay_video_encoder(command: &mut Command, format: ExportForm
 fn write_clip_ass_overlay(
     clip: &ExportClip,
     annotations: &[ExportAnnotation],
+    path: &Path,
 ) -> Result<Option<PathBuf>, MediaError> {
     let events = annotations
         .iter()
-        .filter(|annotation| annotation.visible)
+        .filter(|annotation| {
+            annotation.visible
+                && !matches!(
+                    annotation.annotation_type,
+                    ExportAnnotationType::Blur | ExportAnnotationType::Crop
+                )
+        })
         .filter_map(|annotation| ass_event_for_annotation(clip, annotation))
         .collect::<Vec<_>>();
 
     if events.is_empty() {
         return Ok(None);
-    }
-
-    let path = std::env::temp_dir()
-        .join("video-editor-overlays")
-        .join(format!(
-            "{}_{}.ass",
-            sanitize_path_segment(&clip.id),
-            create_operation_id()
-        ));
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
     }
 
     let mut ass = String::new();
@@ -1733,7 +2034,7 @@ fn write_clip_ass_overlay(
     ass.push('\n');
 
     fs::write(&path, ass)?;
-    Ok(Some(path))
+    Ok(Some(path.to_path_buf()))
 }
 
 fn ass_event_for_annotation(clip: &ExportClip, annotation: &ExportAnnotation) -> Option<String> {
@@ -1772,14 +2073,9 @@ fn ass_text_for_annotation(annotation: &ExportAnnotation) -> Option<String> {
         escape_ass_text(&annotation.label)
       ))
         }
-        ExportAnnotationType::Rectangle | ExportAnnotationType::Crop => {
-            let draw_alpha = ass_alpha(
-                if annotation.annotation_type == ExportAnnotationType::Crop {
-                    annotation.opacity
-                } else {
-                    100.0
-                },
-            );
+        ExportAnnotationType::Blur | ExportAnnotationType::Crop => None,
+        ExportAnnotationType::Rectangle => {
+            let draw_alpha = alpha;
             Some(ass_group(
                 &[
                     rect_draw(x, y, width, line),
@@ -1791,17 +2087,8 @@ fn ass_text_for_annotation(annotation: &ExportAnnotation) -> Option<String> {
                 &draw_alpha,
             ))
         }
-        ExportAnnotationType::Highlight | ExportAnnotationType::Blur => {
-            let fill_alpha = if annotation.annotation_type == ExportAnnotationType::Blur {
-                ass_alpha((annotation.opacity / 2.5).clamp(8.0, 45.0))
-            } else {
-                alpha
-            };
-            Some(ass_draw(
-                &rect_path(x, y, width, height),
-                &color,
-                &fill_alpha,
-            ))
+        ExportAnnotationType::Highlight => {
+            Some(ass_draw(&rect_path(x, y, width, height), &color, &alpha))
         }
         ExportAnnotationType::Circle => Some(ass_draw(
             &ellipse_ring_path(x, y, width, height, line),
@@ -1859,7 +2146,7 @@ fn format_ass_time(seconds: f64) -> String {
 
 fn ass_color(hex: &str) -> String {
     let clean = hex.trim().trim_start_matches('#');
-    if clean.len() != 6 {
+    if clean.len() != 6 || !clean.bytes().all(|b| b.is_ascii_hexdigit()) {
         return "FFFFFF".to_string();
     }
     let r = &clean[0..2];
@@ -2052,7 +2339,7 @@ fn apply_preset(command: &mut Command, preset: &str) {
 }
 
 fn apply_crf(command: &mut Command, crf: u8) {
-    command.arg("-crf").arg(crf.clamp(0, 51).to_string());
+    command.arg("-crf").arg(crf.to_string());
 }
 
 fn run_export_child(
@@ -2065,10 +2352,36 @@ fn run_export_child(
     total_duration: f64,
     clip_label: &str,
     last_details: &mut String,
+    gpu_resources: Option<&BackgroundMediaBackend>,
 ) -> Option<std::process::ExitStatus> {
-    let reader = BufReader::new(stderr);
-    for line in reader.lines().map_while(Result::ok) {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(64);
+    let reader = thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            if sender.send(line).is_err() { break; }
+        }
+    });
+    let mut last_progress = 0.0;
+    let mut last_progress_at = Instant::now();
+    loop {
+        if gpu_resources.is_some_and(|resources| resources.playing.load(Ordering::Acquire)) {
+            *last_details = "GPU released for smooth playback".into();
+            if let Ok(mut child) = child_ref.lock() { let _ = child.kill(); }
+            break;
+        }
+        if gpu_resources.is_some() && last_progress_at.elapsed() > Duration::from_secs(20) {
+            *last_details = "GPU export made no progress for 20 seconds".into();
+            if let Ok(mut child) = child_ref.lock() { let _ = child.kill(); }
+            break;
+        }
+        let line = match receiver.recv_timeout(Duration::from_millis(100)) {
+            Ok(line) => line,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        };
         if let Some(clip_progress) = parse_progress_line(&line, clip_duration) {
+            // The displayed fraction caps at 99%; watchdog progress must keep advancing on long exports.
+            let encoded_time = line.split_once('=').and_then(|(_, value)| value.parse::<f64>().ok()).unwrap_or(0.0);
+            if encoded_time > last_progress { last_progress = encoded_time; last_progress_at = Instant::now(); }
             let progress = ((completed_duration + clip_progress * clip_duration) / total_duration)
                 .clamp(0.0, 0.99);
             let _ = app.emit(
@@ -2084,11 +2397,18 @@ fn run_export_child(
             *last_details = line;
         }
     }
+    drop(receiver);
+    let _ = reader.join();
 
     child_ref
         .lock()
         .ok()
         .and_then(|mut child| child.wait().ok())
+}
+
+fn request_output_paths(request: &ExportTrimRequest) -> Vec<String> {
+    if request.timeline { vec![with_format_extension(Path::new(&request.output_path), request.settings.format)] }
+    else { output_paths_for_clips(&request.output_path, &request.clips, request.settings.format) }
 }
 
 fn output_paths_for_clips(
@@ -2185,6 +2505,42 @@ mod resource_manager_tests {
     use super::*;
 
     #[test]
+    fn proxy_survives_play_pause_but_yields_to_pressure_and_export() {
+        let manager = BackgroundMediaBackend::default();
+        let token = manager.proxy_token();
+        manager.set_playing(true);
+        assert_eq!(manager.proxy_token(), token);
+        let budget = calculate_budget(
+            MediaTaskKind::Proxy,
+            PerformancePreset::Balanced,
+            PressureLevel::Normal,
+            true,
+            false,
+            8,
+        );
+        assert!(budget.allowed);
+        assert_eq!(budget.cpu_threads, 1);
+        for pressure in [PressureLevel::High, PressureLevel::Critical] {
+            assert!(
+                !calculate_budget(
+                    MediaTaskKind::Proxy,
+                    PerformancePreset::Balanced,
+                    pressure,
+                    true,
+                    false,
+                    8
+                )
+                .allowed
+            );
+        }
+        manager.set_playing(false);
+        assert_eq!(manager.proxy_token(), token);
+        manager.set_exporting(true);
+        assert_ne!(manager.proxy_token(), token);
+        assert!(!manager.budget(MediaTaskKind::Proxy).allowed);
+    }
+
+    #[test]
     fn playback_denies_prefetch_and_limits_visible_thumbnails() {
         let visible = calculate_budget(
             MediaTaskKind::VisibleThumbnail,
@@ -2232,3 +2588,9 @@ mod resource_manager_tests {
         assert!(config.waveform_budget.max_parallel_jobs >= 1);
     }
 }
+#[cfg(test)]
+#[path = "export_tests.rs"]
+mod export_tests;
+#[cfg(test)]
+#[path = "playback_tests.rs"]
+mod playback_tests;

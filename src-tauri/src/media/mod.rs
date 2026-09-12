@@ -1,6 +1,10 @@
+pub mod atomic_file;
 pub mod binaries;
 pub mod errors;
 pub mod ffmpeg;
+pub mod acceleration;
 pub mod ffprobe;
+pub mod frame_index;
 pub mod http_server;
 pub mod models;
+pub mod proxy_cache;

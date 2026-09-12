@@ -13,9 +13,11 @@ pub async fn read_text_file(path: String) -> Result<String, AppError> {
 
 #[tauri::command]
 pub async fn write_text_file(path: String, contents: String) -> Result<(), AppError> {
-    tauri::async_runtime::spawn_blocking(move || fs::write(PathBuf::from(path), contents))
-        .await
-        .map_err(|error| AppError::from(MediaError::Io(error.to_string())))?
-        .map_err(MediaError::from)
-        .map_err(AppError::from)
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::media::atomic_file::write(&PathBuf::from(path), contents.as_bytes())
+    })
+    .await
+    .map_err(|error| AppError::from(MediaError::Io(error.to_string())))?
+    .map_err(MediaError::from)
+    .map_err(AppError::from)
 }

@@ -88,6 +88,8 @@ dependencies = [
  "tauri-plugin-log",
  "thiserror 2.0.18",
  "uuid",
+ "webview2-com",
+ "windows-core 0.61.2",
 ]
 
 [[package]]

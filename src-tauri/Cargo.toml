@@ -26,3 +26,7 @@ tauri-plugin-log = "2"
 tauri-plugin-dialog = "2.7.1"
 thiserror = "2.0.18"
 uuid = { version = "1.20.0", features = ["v4"] }
+
+[target.'cfg(windows)'.dependencies]
+webview2-com = "0.38.2"
+windows-core = "0.61"

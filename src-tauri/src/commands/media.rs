@@ -1,3 +1,4 @@
+use crate::media::http_server::{MediaHttpServer, PlaybackRegistration};
 use crate::media::{
     errors::{AppError, MediaError},
     ffmpeg, ffprobe,
@@ -6,11 +7,51 @@ use crate::media::{
     },
 };
 use tauri::State;
-use crate::media::http_server::{MediaHttpServer, PlaybackRegistration};
 
 #[tauri::command]
-pub fn probe_media(input_path: String) -> Result<MediaProbe, AppError> {
-    ffprobe::probe_media(&input_path).map_err(AppError::from)
+pub async fn detect_accelerators(backend: State<'_, ffmpeg::BackgroundMediaBackend>) -> Result<crate::media::acceleration::Status, AppError> {
+    let backend = backend.inner().clone();
+    if backend.runtime_config().playback_active {
+        return Ok(backend.acceleration.status());
+    }
+    tauri::async_runtime::spawn_blocking(move || backend.acceleration.discover()).await
+        .map_err(|error| AppError::from(MediaError::Io(error.to_string())))
+}
+
+#[tauri::command]
+pub fn set_acceleration_settings(backend: State<'_, ffmpeg::BackgroundMediaBackend>, settings: crate::media::acceleration::Settings) -> Result<(), AppError> {
+    backend.acceleration.settings(settings).map_err(|error| AppError::from(MediaError::Io(error)))?;
+    backend.cancel_all();
+    backend.cancel_proxy();
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn get_frame_step(
+    input_path: String,
+    time: f64,
+    direction: i8,
+    index: State<'_, std::sync::Arc<crate::media::frame_index::FrameIndex>>,
+) -> Result<crate::media::frame_index::FrameStep, AppError> {
+    let index = index.inner().clone();
+    let token = index.token();
+    tauri::async_runtime::spawn_blocking(move || index.step(&input_path, time, direction, token))
+        .await
+        .map_err(|error| AppError::from(MediaError::Io(error.to_string())))?
+        .map_err(AppError::from)
+}
+
+#[tauri::command]
+pub fn cancel_frame_steps(index: State<'_, std::sync::Arc<crate::media::frame_index::FrameIndex>>) {
+    index.cancel();
+}
+
+#[tauri::command]
+pub async fn probe_media(input_path: String) -> Result<MediaProbe, AppError> {
+    tauri::async_runtime::spawn_blocking(move || ffprobe::probe_media(&input_path))
+        .await
+        .map_err(|error| AppError::from(MediaError::Io(error.to_string())))?
+        .map_err(AppError::from)
 }
 
 #[tauri::command]
@@ -23,7 +64,9 @@ pub fn register_playback_media(
     server: State<'_, MediaHttpServer>,
     input_path: String,
 ) -> Result<PlaybackRegistration, AppError> {
-    server.register(&input_path).map_err(|error| AppError::from(MediaError::Io(error.to_string())))
+    server
+        .register(&input_path)
+        .map_err(|error| AppError::from(MediaError::Io(error.to_string())))
 }
 
 #[tauri::command]
@@ -57,22 +100,17 @@ pub async fn generate_timeline_thumbnail_range(
 pub async fn generate_audio_waveform(
     backend: State<'_, ffmpeg::BackgroundMediaBackend>,
     request: AudioWaveformRequest,
+    cache_only: Option<bool>,
 ) -> Result<AudioWaveformResult, AppError> {
     let backend = backend.inner().clone();
-    let token = backend.token();
-    tauri::async_runtime::spawn_blocking(move || ffmpeg::generate_audio_waveform(request, &backend, token))
-        .await
-        .map_err(|error| AppError::from(MediaError::Io(error.to_string())))?
-        .map_err(AppError::from)
-}
-
-#[tauri::command]
-pub async fn generate_playback_proxy(
-    input_path: String,
-    video_id: String,
-) -> Result<String, AppError> {
+    let token = backend.waveform_token();
     tauri::async_runtime::spawn_blocking(move || {
-        ffmpeg::generate_playback_proxy(&input_path, &video_id)
+        ffmpeg::generate_audio_waveform_cached(
+            request,
+            &backend,
+            token,
+            cache_only.unwrap_or(false),
+        )
     })
     .await
     .map_err(|error| AppError::from(MediaError::Io(error.to_string())))?
@@ -80,17 +118,42 @@ pub async fn generate_playback_proxy(
 }
 
 #[tauri::command]
-pub fn cancel_background_media(
+pub async fn generate_playback_proxy(
+    input_path: String,
+    video_id: String,
+    force_cpu: Option<bool>,
     backend: State<'_, ffmpeg::BackgroundMediaBackend>,
-) {
-    backend.cancel_all();
+) -> Result<String, AppError> {
+    let backend = backend.inner().clone();
+    let token = backend.proxy_token();
+    tauri::async_runtime::spawn_blocking(move || {
+        if force_cpu.unwrap_or(false) {
+            ffmpeg::generate_playback_proxy_with_options(&input_path, &video_id, &backend, token, true)
+        } else { ffmpeg::generate_playback_proxy(&input_path, &video_id, &backend, token) }
+    })
+    .await
+    .map_err(|error| AppError::from(MediaError::Io(error.to_string())))?
+    .map_err(AppError::from)
 }
 
 #[tauri::command]
-pub fn set_media_playback_state(
+pub fn cancel_timeline_thumbnails(backend: State<'_, ffmpeg::BackgroundMediaBackend>) {
+    backend.cancel_thumbnails();
+}
+
+#[tauri::command]
+pub fn cancel_background_media(
     backend: State<'_, ffmpeg::BackgroundMediaBackend>,
-    playing: bool,
+    include_proxy: Option<bool>,
 ) {
+    backend.cancel_all();
+    if include_proxy.unwrap_or(false) {
+        backend.cancel_proxy();
+    }
+}
+
+#[tauri::command]
+pub fn set_media_playback_state(backend: State<'_, ffmpeg::BackgroundMediaBackend>, playing: bool) {
     backend.set_playing(playing);
 }
 
@@ -120,7 +183,9 @@ pub fn set_performance_preset(
 pub fn update_runtime_metrics(
     backend: State<'_, ffmpeg::BackgroundMediaBackend>,
     metrics: ffmpeg::RuntimeMetrics,
+    ui_long_task_ratio: Option<f64>,
 ) -> Result<ffmpeg::RuntimePerformanceConfig, AppError> {
+    backend.update_ui_load(ui_long_task_ratio);
     backend.update_metrics(metrics).map_err(AppError::from)?;
     Ok(backend.runtime_config())
 }

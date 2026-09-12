@@ -3,6 +3,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExportTrimRequest {
+    #[serde(default)]
+    pub timeline: bool,
+    #[serde(default)]
+    pub operation_id: Option<String>,
     pub input_path: String,
     pub output_path: String,
     pub clips: Vec<ExportClip>,
@@ -14,6 +18,8 @@ pub struct ExportTrimRequest {
 #[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ExportClip {
+    #[serde(default)]
+    pub source_start: Option<f64>,
     pub id: String,
     pub label: String,
     pub start_time: f64,
@@ -144,6 +150,7 @@ pub struct MediaProbe {
     pub time_base: Option<String>,
     pub rotation: Option<i64>,
     pub has_audio: Option<bool>,
+    pub has_video: Option<bool>,
     pub variable_fps: Option<bool>,
     pub bitrate: Option<String>,
     pub audio_streams: Option<String>,

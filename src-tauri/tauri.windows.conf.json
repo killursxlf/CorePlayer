@@ -1,0 +1,14 @@
+{
+  "build": {
+    "beforeBuildCommand": "bun run prepare:ffmpeg && bun run build"
+  },
+  "bundle": {
+    "resources": {
+      "resources/ffmpeg/ffmpeg.exe": "ffmpeg/ffmpeg.exe",
+      "resources/ffmpeg/ffprobe.exe": "ffmpeg/ffprobe.exe",
+      "resources/ffmpeg/LICENSE.txt": "ffmpeg/LICENSE.txt",
+      "resources/ffmpeg/README.txt": "ffmpeg/README.txt",
+      "resources/ffmpeg/bundle.json": "ffmpeg/bundle.json"
+    }
+  }
+}

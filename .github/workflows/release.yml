@@ -63,6 +63,20 @@ jobs:
       - name: Install frontend dependencies
         run: bun install --frozen-lockfile
 
+      - name: Test frontend
+        run: bun test tests
+
+      - name: Cache FFmpeg archive
+        if: matrix.platform == 'windows-latest'
+        uses: actions/cache@v4
+        with:
+          path: .ffmpeg-cache.local/*.zip
+          key: ffmpeg-windows-x64-9.0.1-2e8e28af
+
+      - name: Prepare bundled FFmpeg
+        if: matrix.platform == 'windows-latest'
+        run: bun run prepare:ffmpeg
+
       - name: Test Rust backend
         run: cargo test --manifest-path src-tauri/Cargo.toml --locked
 

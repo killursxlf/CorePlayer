@@ -1,4 +1,5 @@
 export type CachedThumbnail = {
+  videoId: string
   time: number
   intervalSeconds: number
   bitmap: ImageBitmap
@@ -11,6 +12,11 @@ export class ThumbnailCache {
   private maxItems: number
   private maxBytes: number
   private totalBytes = 0
+  private visible: {videoId: string; start: number; end: number} | null = null
+
+  protectVisible(videoId: string, start: number, end: number) {
+    this.visible = {videoId, start, end}
+  }
 
   constructor(maxItems = 250, maxBytes = 128 * 1024 * 1024) {
     this.maxItems = maxItems
@@ -23,8 +29,8 @@ export class ThumbnailCache {
     this.evict()
   }
 
-  makeKey(videoId: string, intervalSeconds: number, time: number) {
-    return `${videoId}:${Math.round(intervalSeconds * 1000)}:${Math.round(time * 1000)}`
+  makeKey(videoId: string, _intervalSeconds: number, time: number) {
+    return `${videoId}:${Math.round(time * 1000)}`
   }
 
   get(videoId: string, intervalSeconds: number, time: number) {
@@ -37,21 +43,7 @@ export class ThumbnailCache {
   }
 
   getAtTimestamp(videoId: string, time: number) {
-    const timestampMs = Math.round(time * 1000)
-    let bestKey: string | null = null
-    let best: CachedThumbnail | null = null
-    for (const [key, item] of this.items) {
-      if (!key.startsWith(`${videoId}:`) || Math.round(item.time * 1000) !== timestampMs) continue
-      if (!best || item.bitmap.width > best.bitmap.width) {
-        bestKey = key
-        best = item
-      }
-    }
-    if (bestKey && best) {
-      this.items.delete(bestKey)
-      this.items.set(bestKey, best)
-    }
-    return best
+    return this.get(videoId, 0, time)
   }
 
   findNearest(
@@ -64,9 +56,9 @@ export class ThumbnailCache {
     let bestDistance = maxDistanceSeconds
     for (const [key, item] of this.items) {
       if (!key.startsWith(`${videoId}:`)) continue
-      if (Math.round(item.intervalSeconds * 1000) !== Math.round(intervalSeconds * 1000)) continue
       const distance = Math.abs(item.time - time)
-      if (distance <= bestDistance) {
+      const coverage = Math.max(maxDistanceSeconds, item.intervalSeconds / 2, intervalSeconds / 2)
+      if (distance <= coverage && (!best || distance < bestDistance)) {
         best = item
         bestDistance = distance
       }
@@ -78,12 +70,16 @@ export class ThumbnailCache {
     const key = this.makeKey(videoId, intervalSeconds, time)
     const previous = this.items.get(key)
     if (previous) {
+      if (previous.bitmap.width >= bitmap.width) {
+        bitmap.close()
+        return
+      }
       this.totalBytes -= previous.estimatedBytes
       previous.bitmap.close()
     }
 
     const estimatedBytes = bitmap.width * bitmap.height * 4
-    this.items.set(key, { time, intervalSeconds, bitmap, sourceUrl, estimatedBytes })
+    this.items.set(key, { videoId, time, intervalSeconds, bitmap, sourceUrl, estimatedBytes })
     this.totalBytes += estimatedBytes
     this.evict()
   }
@@ -92,11 +88,15 @@ export class ThumbnailCache {
     for (const item of this.items.values()) item.bitmap.close()
     this.items.clear()
     this.totalBytes = 0
+    this.visible = null
   }
 
   private evict() {
     while (this.items.size > this.maxItems || this.totalBytes > this.maxBytes) {
-      const first = this.items.keys().next().value
+      const visible = this.visible
+      const first = (visible ? [...this.items.entries()].find(([, item]) => item.videoId !== visible.videoId
+        || item.time + item.intervalSeconds < visible.start || item.time - item.intervalSeconds > visible.end)?.[0] : null)
+        ?? this.items.keys().next().value
       if (!first) return
       const item = this.items.get(first)
       if (item) {

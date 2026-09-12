@@ -1,6 +1,6 @@
 "use client"
 
-import { useCallback, useEffect, useRef, useState } from "react"
+import { useCallback, useEffect, useEffectEvent, useRef, useState } from "react"
 import {
   FileVideo,
   FolderOpen,
@@ -17,27 +17,44 @@ import {
   Minimize,
   Gauge,
 } from "lucide-react"
-import type { Annotation, AnnotationType, ToolId, VideoInfo } from "@/lib/editor-types"
+import type { Annotation, AnnotationType, TimelineClip, ToolId, VideoInfo } from "@/lib/editor-types"
+import { clipAt, sourceStart, sourceTime, editTime } from "@/lib/timeline-edit"
 import { formatTimecode } from "@/lib/editor-types"
 import { cn } from "@/lib/utils"
 import { Slider } from "@/components/ui/slider"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { playbackClock } from "@/stores/playback-clock"
-import type { RuntimeMetrics } from "@/types/media"
+import { PreviewSeekQueue } from "@/lib/preview-seek-queue"
+import type { PlaybackCopyState } from "@/hooks/use-playback-proxy"
+import type { FrameStep, RuntimeMetrics, SeekMode } from "@/types/media"
+import { FrameStepQueue } from "@/lib/frame-step-queue"
+import { getMediaService } from "@/services/media-service-provider"
+import { toMediaServiceError } from "@/services/media-service"
 
 const SPEEDS = ["0.25", "0.5", "1", "1.5", "2"]
 
 interface PreviewProps {
+  clips: TimelineClip[]
+  frameSourcePath: string | null
+  mediaSession: number
+  seekFrameTime: number | null
+  playbackCopy: PlaybackCopyState
+  playbackCopyProgress: number
+  onPreparePlayback: () => void
+  onPlaybackError: () => void
+  onCancelPlaybackCopy: () => void
+  onTogglePlaybackCopy: () => void
   videoInfo: VideoInfo
   playbackUrl: string | null
   currentTime: number
   seekRevision: number
-  seekMode: "preview" | "precise"
+  seekTarget: number
+  seekMode: SeekMode
   duration: number
   isPlaying: boolean
   onTogglePlay: () => void
   onEnded: () => void
-  onSeek: (t: number, mode?: "preview" | "precise") => void
+  onSeek: (t: number, mode?: SeekMode, frameTime?: number) => void
   onLoadedMetadata: (metadata: { duration: number; resolution: string }) => void
   onTimeUpdate: (currentTime: number) => void
   zoom: number
@@ -51,6 +68,7 @@ interface PreviewProps {
   selectedId: string | null
   onSelectAnnotation: (id: string | null) => void
   onCreateAnnotation: (annotation: Annotation) => void
+  onEditStart: () => void
   onUpdateAnnotation: (id: string, patch: Partial<Annotation>) => void
   onOpenVideo: () => void
   hasMedia: boolean
@@ -145,8 +163,8 @@ async function detectPowerEfficientDecode(
 }
 
 function annotationBox(start: NormalizedPoint, end: NormalizedPoint) {
-  const x = Math.min(start.x, end.x)
-  const y = Math.min(start.y, end.y)
+  const x = Math.min(0.985, start.x, end.x)
+  const y = Math.min(0.985, start.y, end.y)
   const width = Math.max(0.015, Math.abs(end.x - start.x))
   const height = Math.max(0.015, Math.abs(end.y - start.y))
   return { x, y, width, height }
@@ -155,8 +173,8 @@ function annotationBox(start: NormalizedPoint, end: NormalizedPoint) {
 function pointsBox(points: NormalizedPoint[]) {
   const xs = points.map((point) => point.x)
   const ys = points.map((point) => point.y)
-  const x = Math.min(...xs)
-  const y = Math.min(...ys)
+  const x = Math.min(0.985, ...xs)
+  const y = Math.min(0.985, ...ys)
   const maxX = Math.max(...xs)
   const maxY = Math.max(...ys)
   const width = Math.max(0.015, maxX - x)
@@ -166,18 +184,18 @@ function pointsBox(points: NormalizedPoint[]) {
 
 function normalizePathPoints(points: NormalizedPoint[], box: { x: number; y: number; width: number; height: number }) {
   return points.map((point) => ({
-    x: (point.x - box.x) / box.width,
-    y: (point.y - box.y) / box.height,
+    x: Math.min(1, Math.max(0, (point.x - box.x) / box.width)),
+    y: Math.min(1, Math.max(0, (point.y - box.y) / box.height)),
   }))
 }
 
 function lineGeometry(start: NormalizedPoint, end: NormalizedPoint) {
   const box = annotationBox(start, end)
   return {
-    lineStartX: (start.x - box.x) / box.width,
-    lineStartY: (start.y - box.y) / box.height,
-    lineEndX: (end.x - box.x) / box.width,
-    lineEndY: (end.y - box.y) / box.height,
+    lineStartX: Math.min(1, Math.max(0, (start.x - box.x) / box.width)),
+    lineStartY: Math.min(1, Math.max(0, (start.y - box.y) / box.height)),
+    lineEndX: Math.min(1, Math.max(0, (end.x - box.x) / box.width)),
+    lineEndY: Math.min(1, Math.max(0, (end.y - box.y) / box.height)),
   }
 }
 
@@ -225,8 +243,8 @@ function buildAnnotation(
     thickness: style.thickness,
     font: "Inter",
     visible: true,
-    startTime: currentTime,
-    endTime: Math.max(currentTime + 0.25, visibleEnd),
+    startTime: type === "crop" ? 0 : Math.min(currentTime, Math.max(0, duration - 0.001)),
+    endTime: type === "crop" ? duration : Math.min(duration, Math.max(currentTime + 0.25, visibleEnd)),
     ...box,
     ...(type === "arrow" || type === "measure" ? lineGeometry(start, end) : {}),
     ...((type === "brush" || type === "pen") && points && points.length > 1
@@ -257,12 +275,14 @@ function AnnotationOverlay({
   activeTool,
   onClick,
   onMoveStart,
+  unitScale,
 }: {
   a: Annotation
   selected: boolean
   activeTool: ToolId
   onClick: () => void
   onMoveStart: (event: React.PointerEvent, annotation: Annotation) => void
+  unitScale: number
 }) {
   const base: React.CSSProperties = {
     position: "absolute",
@@ -270,7 +290,7 @@ function AnnotationOverlay({
     top: `${a.y * 100}%`,
     width: `${a.width * 100}%`,
     height: `${a.height * 100}%`,
-    opacity: a.type === "blur" ? 1 : a.opacity / 100,
+    opacity: a.opacity / 100,
   }
   const ring = selected ? "0 0 0 2px var(--color-primary)" : "none"
   const points = linePoints(a)
@@ -294,13 +314,13 @@ function AnnotationOverlay({
       {a.type === "rectangle" && (
         <div
           className="size-full rounded-sm"
-          style={{ border: `${a.thickness}px solid ${a.color}`, boxShadow: ring }}
+          style={{ border: `${a.thickness * unitScale}px solid ${a.color}`, boxShadow: ring }}
         />
       )}
       {a.type === "circle" && (
         <div
           className="size-full rounded-full"
-          style={{ border: `${a.thickness}px solid ${a.color}`, boxShadow: ring }}
+          style={{ border: `${a.thickness * unitScale}px solid ${a.color}`, boxShadow: ring }}
         />
       )}
       {a.type === "highlight" && (
@@ -313,18 +333,18 @@ function AnnotationOverlay({
         <div
           className="size-full rounded-sm"
           style={{
-            border: `1px dashed ${a.color}`,
+            border: selected ? `1px dashed ${a.color}` : undefined,
             boxShadow: ring,
-            backdropFilter: `blur(${Math.max(4, a.thickness * 2)}px)`,
-            WebkitBackdropFilter: `blur(${Math.max(4, a.thickness * 2)}px)`,
-            backgroundColor: `rgba(255,255,255,${Math.max(0.04, a.opacity / 500)})`,
+            backdropFilter: `blur(${Math.max(4, a.thickness * 2) * unitScale}px)`,
+            WebkitBackdropFilter: `blur(${Math.max(4, a.thickness * 2) * unitScale}px)`,
+
           }}
         />
       )}
       {a.type === "crop" && (
         <div
           className="size-full rounded-sm bg-black/5"
-          style={{ border: `${Math.max(1, a.thickness)}px dashed ${a.color}`, boxShadow: ring }}
+          style={{ border: `1px dashed ${a.color}`, boxShadow: "0 0 0 9999px rgb(0 0 0 / 65%)" }}
         />
       )}
       {a.type === "arrow" && (
@@ -340,7 +360,7 @@ function AnnotationOverlay({
             x2={points.x2}
             y2={points.y2}
             stroke={a.color}
-            strokeWidth={a.thickness}
+            strokeWidth={a.thickness * unitScale}
             strokeLinecap="round"
             markerEnd={`url(#arrow-${a.id})`}
           />
@@ -354,7 +374,7 @@ function AnnotationOverlay({
             x2={points.x2}
             y2={points.y2}
             stroke={a.color}
-            strokeWidth={a.thickness}
+            strokeWidth={a.thickness * unitScale}
             strokeLinecap="round"
             strokeDasharray="5 4"
             vectorEffect="non-scaling-stroke"
@@ -364,7 +384,7 @@ function AnnotationOverlay({
             y="45%"
             textAnchor="middle"
             fill={a.color}
-            fontSize="11"
+            fontSize={22 * unitScale}
             fontWeight="700"
             paintOrder="stroke"
             stroke="black"
@@ -377,7 +397,7 @@ function AnnotationOverlay({
       {a.type === "text" && (
         <div
           className="flex size-full items-center justify-center rounded-sm px-1 text-center font-semibold"
-          style={{ color: a.color, fontSize: `${a.thickness + 6}px`, boxShadow: ring }}
+          style={{ color: a.color, fontSize: `${Math.max(10, a.thickness + 6) * unitScale}px`, fontFamily: a.font, fontWeight: 400, textShadow: `0 0 ${2 * unitScale}px black`, boxShadow: ring }}
         >
           {a.label}
         </div>
@@ -388,10 +408,10 @@ function AnnotationOverlay({
             d={pathData(a.pathPoints) || "M 5 50 Q 25 10 50 50 T 95 50"}
             fill="none"
             stroke={a.color}
-            strokeWidth={a.thickness}
+            strokeWidth={a.thickness * unitScale}
             strokeLinecap="round"
             strokeLinejoin="round"
-            opacity={a.type === "brush" ? 0.88 : 1}
+            opacity={1}
             vectorEffect="non-scaling-stroke"
           />
         </svg>
@@ -508,10 +528,21 @@ function DraftOverlay({ draft }: { draft: DraftAnnotation }) {
 }
 
 export function Preview({
+  clips,
+  frameSourcePath,
+  mediaSession,
+  seekFrameTime: timelineFrameTime,
+  playbackCopy,
+  playbackCopyProgress,
+  onPreparePlayback,
+  onPlaybackError,
+  onCancelPlaybackCopy,
+  onTogglePlaybackCopy,
   videoInfo,
   playbackUrl,
   currentTime,
   seekRevision,
+  seekTarget: timelineSeekTarget,
   seekMode,
   duration,
   isPlaying,
@@ -531,6 +562,7 @@ export function Preview({
   selectedId,
   onSelectAnnotation,
   onCreateAnnotation,
+  onEditStart,
   onUpdateAnnotation,
   onOpenVideo,
   hasMedia,
@@ -540,6 +572,17 @@ export function Preview({
   const previewRef = useRef<HTMLDivElement | null>(null)
   const videoSurfaceRef = useRef<HTMLDivElement | null>(null)
   const videoRef = useRef<HTMLVideoElement | null>(null)
+  const activeClipRef = useRef<TimelineClip | null>(null)
+  const requestedClip = clipAt(clips, timelineSeekTarget) ?? (timelineSeekTarget >= duration ? clips.at(-1) : undefined)
+  const showGap = !requestedClip
+  const seekTarget = requestedClip ? Math.max(0, sourceTime(requestedClip, Math.min(timelineSeekTarget, requestedClip.endTime - 0.000001))) : 0
+  const seekFrameTime = requestedClip && timelineFrameTime !== null ? sourceTime(requestedClip, timelineFrameTime) : null
+  const previewSeeksRef = useRef(new PreviewSeekQueue())
+  const frameStepsRef = useRef<FrameStepQueue | null>(null)
+  const pausedFrameTimeRef = useRef<number | null>(null)
+  const presentedFrameRef = useRef<number | null>(null)
+  const [isReadingFrames, setIsReadingFrames] = useState(false)
+  const mediaService = getMediaService()
   const hardwareDecodeAvailableRef = useRef<boolean | undefined>(undefined)
   const lastAudibleVolumeRef = useRef(80)
   const [isFullscreen, setIsFullscreen] = useState(false)
@@ -548,9 +591,110 @@ export function Preview({
   const [didDragTool, setDidDragTool] = useState(false)
   const [isSeekingMedia, setIsSeekingMedia] = useState(false)
   const [seekError, setSeekError] = useState<string | null>(null)
+  const containerRef = useRef<HTMLDivElement | null>(null)
+  const [surfaceSize, setSurfaceSize] = useState({width: 960, height: 540})
+  const [mediaAspect, setMediaAspect] = useState(16 / 9)
   const frame = 1 / videoInfo.fps
+  const publishFrameStep = useEffectEvent((step: FrameStep) => {
+    const clip = step.editClipId ? clips.find(c => c.id === step.editClipId) : activeClipRef.current
+    if (!clip) return
+    activeClipRef.current = clip
+    pausedFrameTimeRef.current = step.time
+    onSeek(editTime(clip, step.seekTime), "frame", editTime(clip, step.time))
+  })
+  const readFrame = useEffectEvent(async (time: number, direction: -1 | 1): Promise<FrameStep> => {
+    const clip = activeClipRef.current
+    if (!frameSourcePath || !clip) throw new Error("Выберите клип для покадрового перехода.")
+    const step = await mediaService.getFrameStep(frameSourcePath, time, direction)
+    const sourceEnd = sourceStart(clip) + clip.endTime - clip.startTime
+    if (step.time >= sourceStart(clip) && step.time < sourceEnd && (!step.atBoundary || !clips[clips.findIndex(c => c.id === clip.id) + direction])) return step
+    const adjacent = clips[clips.findIndex(c => c.id === clip.id) + direction]
+    const lastFrameBefore = async (end: number) => {
+      const previous = await mediaService.getFrameStep(frameSourcePath, end, -1)
+      const containing = await mediaService.getFrameStep(frameSourcePath, previous.time, 1)
+      return containing.time < end ? containing : previous
+    }
+    if (!adjacent) return direction > 0 ? lastFrameBefore(sourceEnd) : mediaService.getFrameStep(frameSourcePath, Math.max(0, sourceStart(clip) - 0.000003), sourceStart(clip) === 0 ? -1 : 1)
+    const boundary = sourceStart(adjacent) + (direction > 0 ? -0.000003 : adjacent.endTime - adjacent.startTime)
+    const adjacentFrame = direction < 0 ? await lastFrameBefore(boundary) : await mediaService.getFrameStep(frameSourcePath, Math.max(0, boundary), boundary < 0 ? -1 : 1)
+    return { ...adjacentFrame, editClipId: adjacent.id }
+  })
+  useEffect(() => {
+    if (!frameSourcePath || !playbackUrl) return
+    const queue = new FrameStepQueue({
+      currentTime: () => Math.max(0, presentedFrameRef.current ?? videoRef.current?.currentTime ?? 0),
+      read: (time, direction) => readFrame(time, direction),
+      publish: step => publishFrameStep(step),
+      cancelRead: () => mediaService.cancelFrameSteps(),
+      busy: setIsReadingFrames,
+      error: error => { const details = toMediaServiceError(error); setSeekError(details.technicalDetails || details.message) },
+    })
+    frameStepsRef.current = queue
+    return () => { queue.cancel(); frameStepsRef.current = null }
+  }, [frameSourcePath, mediaService, playbackUrl, mediaSession])
+  useEffect(() => {
+    if (isPlaying) {
+      pausedFrameTimeRef.current = null
+      frameStepsRef.current?.cancel()
+    }
+  }, [isPlaying])
+
+  const requestFrameStep = useCallback((direction: -1 | 1) => {
+    const video = videoRef.current
+    if (!video || videoInfo.hasVideo === false) return
+    video.pause()
+    onEnded()
+    setSeekError(null)
+    previewSeeksRef.current.clear()
+    void mediaService.cancelBackgroundMedia(false).catch(() => undefined)
+    frameStepsRef.current?.request(direction)
+  }, [mediaService, onEnded, videoInfo.hasVideo])
+  useEffect(() => {
+    const stepKey = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null
+      if (event.defaultPrevented || event.ctrlKey || event.metaKey || event.altKey || target?.closest("input,textarea,select,[contenteditable=true],[role=dialog],[role=alertdialog]")) return
+      if (event.key !== "," && event.key !== ".") return
+      event.preventDefault()
+      requestFrameStep(event.key === "," ? -1 : 1)
+    }
+    window.addEventListener("keydown", stepKey)
+    return () => window.removeEventListener("keydown", stepKey)
+  }, [requestFrameStep])
+  const reportPlaybackFailure = useEffectEvent((source: string, error: unknown) => {
+    if (!isPlaying || videoRef.current?.src !== source) return
+    if (error instanceof DOMException && error.name === "AbortError") return
+    setSeekError(error instanceof Error ? error.message : "Could not play this media file.")
+    onEnded()
+  })
+  const applyPlaybackIntent = useEffectEvent(() => {
+    const video = videoRef.current
+    if (!video) return
+    video.playbackRate = Number(playbackSpeed)
+    video.volume = Math.max(0, Math.min(1, volume / 100))
+    if (!isPlaying) { video.pause(); return }
+    if (!clips.length) { video.pause(); onEnded(); return }
+    if (!activeClipRef.current) { video.pause(); return }
+    if (playbackClock.getSnapshot() >= duration - 0.000001) { onSeek(0, "precise"); return }
+    const source = video.src
+    void video.play().catch(error => reportPlaybackFailure(source, error))
+  })
+  useEffect(() => {
+    const container = containerRef.current
+    if (!container) return
+    const resize = () => {
+      const style = getComputedStyle(container)
+      const width = Math.max(1, container.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight))
+      const height = Math.max(1, container.clientHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom))
+      const fitWidth = Math.min(width, height * mediaAspect, isFullscreen ? Infinity : 1024)
+      setSurfaceSize({width: fitWidth, height: fitWidth / mediaAspect})
+    }
+    const observer = new ResizeObserver(resize)
+    observer.observe(container)
+    resize()
+    return () => observer.disconnect()
+  }, [hasMedia, isFullscreen, mediaAspect])
   const visibleAnnotations = annotations.filter(
-    (a) => a.visible && currentTime >= a.startTime && currentTime <= a.endTime,
+    (a) => a.visible && currentTime >= a.startTime && currentTime < a.endTime,
   )
 
   const toggleFullscreen = useCallback(() => {
@@ -586,7 +730,7 @@ export function Preview({
 
   const startToolDrag = useCallback(
     (event: React.PointerEvent<HTMLDivElement>) => {
-      if (!drawingTools.has(activeTool)) return
+      if (videoInfo.hasVideo === false || !drawingTools.has(activeTool)) return
       const surface = videoSurfaceRef.current
       const type = annotationToolTypes[activeTool]
       if (!surface || !type) return
@@ -603,7 +747,7 @@ export function Preview({
         points: type === "brush" || type === "pen" ? [point] : undefined,
       })
     },
-    [activeTool],
+    [activeTool, videoInfo.hasVideo],
   )
 
   const updateToolDrag = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
@@ -659,6 +803,7 @@ export function Preview({
 
       event.preventDefault()
       event.stopPropagation()
+      onEditStart()
       onSelectAnnotation(annotation.id)
 
       const start = pointFromEvent(event, surface)
@@ -673,11 +818,15 @@ export function Preview({
       const up = () => {
         window.removeEventListener("pointermove", move)
         window.removeEventListener("pointerup", up)
+        window.removeEventListener("pointercancel", up)
+        window.removeEventListener("blur", up)
       }
       window.addEventListener("pointermove", move)
       window.addEventListener("pointerup", up)
+      window.addEventListener("pointercancel", up)
+      window.addEventListener("blur", up)
     },
-    [onSelectAnnotation, onUpdateAnnotation],
+    [onEditStart, onSelectAnnotation, onUpdateAnnotation],
   )
 
   const setPreviewVolume = useCallback(
@@ -713,6 +862,9 @@ export function Preview({
     if (!video) return
 
     video.pause()
+    previewSeeksRef.current.clear()
+    presentedFrameRef.current = null
+    pausedFrameTimeRef.current = null
     video.removeAttribute("src")
     video.load()
     setIsSeekingMedia(false)
@@ -726,29 +878,43 @@ export function Preview({
   useEffect(() => {
     const video = videoRef.current
     if (!video || !playbackUrl || seekRevision === 0) return
+    activeClipRef.current = requestedClip ?? null
+    if (!requestedClip) { video.pause(); previewSeeksRef.current.clear(); frameStepsRef.current?.cancel(); return }
+    if (seekMode !== "frame") {
+      pausedFrameTimeRef.current = null
+      frameStepsRef.current?.cancel()
+    }
 
-    const requestedTarget = Math.max(0, currentTime)
+    const requestedTarget = Math.max(0, seekTarget)
     const fastSeek = (video as HTMLVideoElement & { fastSeek?: (time: number) => void }).fastSeek
     if (seekMode === "preview") {
-      if (video.readyState < HTMLMediaElement.HAVE_METADATA) return
-      const previewTarget = Math.min(
-        requestedTarget,
-        Number.isFinite(video.duration) ? video.duration : requestedTarget,
-      )
-      setSeekError(null)
-      if (typeof fastSeek === "function") {
-        fastSeek.call(video, previewTarget)
-      } else {
-        video.currentTime = previewTarget
+      const queue = previewSeeksRef.current
+      const apply = (time: number) => {
+        const target = Math.min(time, Number.isFinite(video.duration) ? video.duration : time)
+        if (typeof fastSeek === "function") fastSeek.call(video, target)
+        else video.currentTime = target
       }
-      return
+      const flush = () => { if (!video.seeking && video.readyState >= HTMLMediaElement.HAVE_METADATA) queue.flush(apply) }
+      video.addEventListener("seeked", flush)
+      video.addEventListener("loadedmetadata", flush)
+      queue.request(requestedTarget, video.seeking || video.readyState < HTMLMediaElement.HAVE_METADATA, apply)
+      return () => {
+        video.removeEventListener("seeked", flush)
+        video.removeEventListener("loadedmetadata", flush)
+      }
     }
+    previewSeeksRef.current.clear()
 
     let cancelled = false
     let timeout: number | null = null
     let beginFrame: number | null = null
     let recoveryAttempted = false
     let waitingForMetadata = false
+    let frameCallback: number | null = null
+    const expectedFrame = seekMode === "frame" ? seekFrameTime : null
+    const canObserveFrame = typeof video.requestVideoFrameCallback === "function"
+    let shownFrame = presentedFrameRef.current
+    const frameMatches = () => expectedFrame !== null && shownFrame !== null && Math.abs(shownFrame - expectedFrame) <= 0.000002
 
     const diagnostics = () => ({
       target: requestedTarget,
@@ -775,7 +941,9 @@ export function Preview({
       }
       setIsSeekingMedia(false)
       setSeekError(null)
-      if (isPlaying) void video.play().catch(() => undefined)
+      if (frameCallback !== null) video.cancelVideoFrameCallback(frameCallback)
+      if (expectedFrame !== null) onTimeUpdate(editTime(requestedClip, expectedFrame))
+      applyPlaybackIntent()
     }
 
     const seek = () => {
@@ -785,7 +953,7 @@ export function Preview({
         0,
         Math.min(requestedTarget, Number.isFinite(video.duration) ? video.duration : requestedTarget),
       )
-      if (Math.abs(video.currentTime - target) < 0.001 && !video.seeking) {
+      if (!video.seeking && (expectedFrame !== null ? frameMatches() : Math.abs(video.currentTime - target) < 0.001)) {
         finish()
         return
       }
@@ -800,6 +968,7 @@ export function Preview({
       }
       waitingForMetadata = true
       video.addEventListener("loadedmetadata", seek, { once: true })
+      armTimeout()
     }
 
     const armTimeout = () => {
@@ -817,8 +986,15 @@ export function Preview({
           waitingForMetadata = true
           video.addEventListener("loadedmetadata", seek, { once: true })
           video.load()
+          armTimeout()
           return
         }
+        cancelled = true
+        frameStepsRef.current?.cancel()
+        video.removeEventListener("loadedmetadata", seek)
+        video.removeEventListener("seeked", seekFinished)
+        video.pause()
+        onEnded()
         setIsSeekingMedia(false)
         setSeekError("Could not seek this media file. The container index or codec may be unsupported.")
       }, 8_000)
@@ -829,30 +1005,106 @@ export function Preview({
       setIsSeekingMedia(true)
       setSeekError(null)
     })
-    video.addEventListener("seeked", finish)
+    const seekFinished = () => {
+      if (video.seeking) return
+      if (expectedFrame !== null && canObserveFrame) { if (frameMatches()) finish() }
+      else if (Math.abs(video.currentTime - Math.min(requestedTarget, video.duration)) < Math.max(frame, 0.05)) finish()
+    }
+    if (expectedFrame !== null && canObserveFrame) {
+      const observe: VideoFrameRequestCallback = (_now, metadata) => {
+        if (cancelled) return
+        shownFrame = metadata.mediaTime
+        if (frameMatches() && !video.seeking) finish()
+        else frameCallback = video.requestVideoFrameCallback(observe)
+      }
+      frameCallback = video.requestVideoFrameCallback(observe)
+    }
+    video.addEventListener("seeked", seekFinished)
     waitForMetadataOrSeek()
     if (import.meta.env.DEV) console.info("[media-seek:start]", diagnostics())
     return () => {
       cancelled = true
       if (beginFrame != null) cancelAnimationFrame(beginFrame)
       if (timeout != null) window.clearTimeout(timeout)
+      if (frameCallback !== null) video.cancelVideoFrameCallback(frameCallback)
       if (waitingForMetadata) video.removeEventListener("loadedmetadata", seek)
-      video.removeEventListener("seeked", finish)
+      video.removeEventListener("seeked", seekFinished)
     }
-  // currentTime and isPlaying are sampled when the explicit seek revision changes;
+  // The target is independent of media timeupdate events;
   // ordinary timeupdate events must not restart this state machine.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [playbackUrl, seekMode, seekRevision])
+  }, [playbackUrl, seekMode, seekRevision, seekTarget, seekFrameTime, clips, timelineSeekTarget])
 
+  const publishFrameTime = useEffectEvent((time: number) => {
+    presentedFrameRef.current = time
+    const clip = activeClipRef.current
+    const video = videoRef.current
+    if (!clip || !video || video.seeking || showGap || !isPlaying) return
+    const mapped = Math.max(clip.startTime, editTime(clip, time))
+    if (isPlaying && mapped >= clip.endTime - 0.000001) {
+      video.pause()
+      const next = clips[clips.findIndex(c => c.id === clip.id) + 1]
+      if (next) onSeek(clip.endTime, "precise")
+      else { playbackClock.set(duration); onTimeUpdate(duration); onEnded() }
+      return
+    }
+    if (seekMode !== "preview") playbackClock.set(Math.min(clip.endTime, mapped))
+  })
+
+  const mediaEnded = useEffectEvent(() => {
+    const clip = activeClipRef.current
+    const next = clip && clips[clips.findIndex(c => c.id === clip.id) + 1]
+    if (isPlaying && clip && next) onSeek(clip.endTime, "precise")
+    else { playbackClock.set(duration); onTimeUpdate(duration); onEnded() }
+  })
+
+  const mediaTimeUpdate = useEffectEvent(() => {
+    const video = videoRef.current
+    const clip = activeClipRef.current
+    if (!video || !clip || video.seeking || showGap || seekMode === "preview") return
+    const source = !isPlaying ? pausedFrameTimeRef.current ?? video.currentTime : video.currentTime
+    publishFrameTime(source)
+    onTimeUpdate(Math.max(clip.startTime, Math.min(clip.endTime, editTime(clip, source))))
+  })
+  useEffect(() => {
+    const video = videoRef.current
+    if (!video) return
+    video.addEventListener("timeupdate", mediaTimeUpdate)
+    video.addEventListener("ended", mediaEnded)
+    return () => {
+      video.removeEventListener("timeupdate", mediaTimeUpdate)
+      video.removeEventListener("ended", mediaEnded)
+    }
+  }, [playbackUrl])
+
+  const advanceGap = useEffectEvent((time: number, end: number) => {
+    playbackClock.set(time)
+    onTimeUpdate(time)
+    if (time >= end) { if (end < duration) onSeek(end, "precise"); else onEnded() }
+  })
+
+  useEffect(() => {
+    if (!showGap || !isPlaying) return
+    const start = playbackClock.getSnapshot()
+    const end = clips.find(clip => clip.startTime > start)?.startTime ?? duration
+    const started = performance.now()
+    let frame = 0
+    const tick = () => {
+      const time = Math.min(end, start + (performance.now() - started) / 1000 * Number(playbackSpeed))
+      advanceGap(time, end)
+      if (time >= end) return
+      frame = requestAnimationFrame(tick)
+    }
+    frame = requestAnimationFrame(tick)
+    return () => cancelAnimationFrame(frame)
+  }, [showGap, isPlaying, playbackSpeed, clips, duration, timelineSeekTarget])
   useEffect(() => {
     const video = videoRef.current
     if (!video) return
 
-    if (isPlaying) {
-      void video.play().catch(() => undefined)
-    } else {
-      video.pause()
-    }
+    applyPlaybackIntent()
+    video.addEventListener("loadedmetadata", applyPlaybackIntent)
+    return () => video.removeEventListener("loadedmetadata", applyPlaybackIntent)
   }, [isPlaying, playbackUrl])
 
   useEffect(() => {
@@ -867,7 +1119,7 @@ export function Preview({
     if (!video) return
 
     video.playbackRate = Number.parseFloat(playbackSpeed)
-  }, [playbackSpeed])
+  }, [playbackSpeed, playbackUrl])
 
   useEffect(() => {
     const video = videoRef.current
@@ -876,16 +1128,18 @@ export function Preview({
     let frameRequest: number | null = null
     let animationFrame: number | null = null
 
-    const update = () => {
+    const update: VideoFrameRequestCallback = (_now, metadata) => {
       if (cancelled) return
-      playbackClock.set(video.currentTime)
-      if ("requestVideoFrameCallback" in video) {
-        frameRequest = video.requestVideoFrameCallback(update)
-      } else {
-        animationFrame = requestAnimationFrame(update)
-      }
+      publishFrameTime(metadata.mediaTime)
+      frameRequest = video.requestVideoFrameCallback(update)
     }
-    update()
+    const fallback = () => {
+      if (cancelled) return
+      publishFrameTime(video.currentTime)
+      if (isPlaying) animationFrame = requestAnimationFrame(fallback)
+    }
+    if (typeof video.requestVideoFrameCallback === "function" && videoInfo.hasVideo !== false) frameRequest = video.requestVideoFrameCallback(update)
+    else fallback()
     return () => {
       cancelled = true
       if (frameRequest != null && "cancelVideoFrameCallback" in video) {
@@ -893,10 +1147,11 @@ export function Preview({
       }
       if (animationFrame != null) cancelAnimationFrame(animationFrame)
     }
-  }, [playbackUrl])
+  }, [isPlaying, playbackUrl, videoInfo.hasVideo])
 
   useEffect(() => {
     let cancelled = false
+    hardwareDecodeAvailableRef.current = undefined
     void detectPowerEfficientDecode(
       videoInfo.codec,
       videoInfo.resolution,
@@ -928,11 +1183,12 @@ export function Preview({
   ])
 
   useEffect(() => {
-    if (!isPlaying) return
     const video = videoRef.current
-    if (!video) return
+    if (!video || !playbackUrl) return
     let longTaskCount = 0
     let longTaskDuration = 0
+    let lastLongTaskDuration = 0
+    let lastMetricsAt = performance.now()
     const observer = typeof PerformanceObserver !== "undefined"
       ? new PerformanceObserver((entries) => {
           for (const entry of entries.getEntries()) {
@@ -954,17 +1210,21 @@ export function Preview({
     let samples = 0
     const interval = window.setInterval(() => {
       const quality = video.getVideoPlaybackQuality?.()
-      if (!quality) return
-      const totalDelta = Math.max(0, quality.totalVideoFrames - lastTotalFrames)
-      const droppedDelta = Math.max(0, quality.droppedVideoFrames - lastDroppedFrames)
-      lastTotalFrames = quality.totalVideoFrames
-      lastDroppedFrames = quality.droppedVideoFrames
+      const totalDelta = Math.max(0, (quality?.totalVideoFrames ?? 0) - lastTotalFrames)
+      const droppedDelta = Math.max(0, (quality?.droppedVideoFrames ?? 0) - lastDroppedFrames)
+      lastTotalFrames = quality?.totalVideoFrames ?? 0
+      lastDroppedFrames = quality?.droppedVideoFrames ?? 0
       frameSamples.push({ total: totalDelta, dropped: droppedDelta })
       if (frameSamples.length > 5) frameSamples.shift()
       const rollingFrames = frameSamples.reduce((sum, sample) => sum + sample.total, 0)
       const rollingDropped = frameSamples.reduce((sum, sample) => sum + sample.dropped, 0)
-      const droppedFrameRatio = rollingFrames > 0 ? rollingDropped / rollingFrames : 0
+      const droppedFrameRatio = isPlaying && !video.seeking && rollingFrames > 0 ? rollingDropped / rollingFrames : 0
+      const now = performance.now()
+      const uiLongTaskRatio = Math.min(1, (longTaskDuration - lastLongTaskDuration) / Math.max(1, now - lastMetricsAt))
+      lastMetricsAt = now
+      lastLongTaskDuration = longTaskDuration
       onPerformanceMetrics?.({
+        uiLongTaskRatio,
         droppedFrameRatio,
         userActive: false,
         windowVisible: document.visibilityState === "visible",
@@ -974,8 +1234,8 @@ export function Preview({
       if (import.meta.env.DEV && samples % 5 === 0) {
         console.info("[media-profile]", {
           elapsedSeconds: Math.round((performance.now() - startedAt) / 100) / 10,
-          decodedFrames: quality.totalVideoFrames - (initial?.totalVideoFrames ?? 0),
-          droppedFrames: quality.droppedVideoFrames - (initial?.droppedVideoFrames ?? 0),
+          decodedFrames: (quality?.totalVideoFrames ?? 0) - (initial?.totalVideoFrames ?? 0),
+          droppedFrames: (quality?.droppedVideoFrames ?? 0) - (initial?.droppedVideoFrames ?? 0),
           droppedFrameRatio,
           longTasks: longTaskCount,
           longTaskMilliseconds: Math.round(longTaskDuration),
@@ -999,10 +1259,10 @@ export function Preview({
       {/* Info header */}
       <div className="flex h-9 shrink-0 items-center gap-4 border-b border-border px-4 text-xs">
         <span className="font-medium text-foreground">{videoInfo.filename}</span>
-        {hasMedia && (
+        {hasMedia && videoInfo.hasVideo !== false && (
           <>
             <span className="text-muted-foreground">{videoInfo.resolution}</span>
-            <span className="text-muted-foreground">{videoInfo.fps} fps</span>
+            <span className="text-muted-foreground">{Number(videoInfo.fps.toFixed(3))} fps{videoInfo.variableFps ? " (variable)" : ""}</span>
           </>
         )}
         <span className="ml-auto font-mono tabular-nums text-muted-foreground">
@@ -1015,15 +1275,32 @@ export function Preview({
         )}
       </div>
 
+      {hasMedia && videoInfo.hasVideo !== false && (
+        <div className="flex min-h-8 shrink-0 items-center gap-3 border-b border-border px-4 py-1 text-xs">
+          {playbackCopy.status === "preparing" ? <>
+            <span role="status">Preparing smoother playback: {Math.round(playbackCopyProgress * 100)}%</span>
+            <button className="text-muted-foreground hover:text-foreground" onClick={onCancelPlaybackCopy}>Cancel</button>
+          </> : playbackCopy.path ? <>
+            <span>{playbackCopy.active ? "Optimized preview" : "Original preview"}</span>
+            <button disabled={playbackCopy.status === "switching"} className="text-primary disabled:opacity-50" onClick={onTogglePlaybackCopy}>
+              {playbackCopy.status === "switching" ? "Switching…" : playbackCopy.active ? "Use original" : "Use optimized copy"}
+            </button>
+          </> : <button className="text-primary" onClick={onPreparePlayback}>
+            {playbackCopy.status === "error" ? "Retry playback optimization" : "Optimize playback"}
+          </button>}
+          {playbackCopy.error && <span role="alert" className="text-destructive">{playbackCopy.error}</span>}
+        </div>
+      )}
+
       {!hasMedia ? (
         <div className="flex min-h-0 flex-1 items-center justify-center p-6">
           <div className="flex w-full max-w-xl flex-col items-center rounded-xl border border-dashed border-border bg-card/35 px-8 py-10 text-center">
             <div className="mb-5 flex size-14 items-center justify-center rounded-lg bg-primary/12 text-primary ring-1 ring-primary/20">
               <FileVideo className="size-7" />
             </div>
-            <h1 className="text-xl font-semibold tracking-tight text-foreground">Choose a video file</h1>
+            <h1 className="text-xl font-semibold tracking-tight text-foreground">Choose a video or audio file</h1>
             <p className="mt-2 max-w-sm text-sm leading-6 text-muted-foreground">
-              Open a local video to enable preview, trimming, timeline tracks, media details, and export.
+              Open local video or audio to preview, trim, edit and export clips.
             </p>
             <button
               type="button"
@@ -1032,7 +1309,7 @@ export function Preview({
               className="mt-6 inline-flex h-9 items-center gap-2 rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:pointer-events-none disabled:opacity-60"
             >
               <FolderOpen className="size-4" />
-              {isLoading ? "Opening..." : "Open video"}
+              {isLoading ? "Opening..." : "Open media"}
             </button>
           </div>
         </div>
@@ -1040,6 +1317,7 @@ export function Preview({
         <>
       {/* Video canvas */}
       <div
+        ref={containerRef}
         className={cn("flex min-h-0 flex-1 items-center justify-center overflow-hidden p-6", isFullscreen && "p-4")}
         onWheel={handleFullscreenWheel}
       >
@@ -1067,10 +1345,12 @@ export function Preview({
             }
           }}
           className={cn(
-            "group relative aspect-video max-h-full w-full cursor-default overflow-hidden rounded-xl bg-black shadow-2xl ring-1 ring-border",
+            "group relative shrink-0 cursor-default overflow-hidden rounded-xl bg-black shadow-2xl ring-1 ring-border",
             isFullscreen ? "max-w-none rounded-none" : "max-w-5xl",
           )}
           style={{
+            width: surfaceSize.width,
+            height: surfaceSize.height,
             transform: `scale(${Math.min(isFullscreen ? 4 : 1.4, zoom / 100)})`,
             transformOrigin: isFullscreen ? zoomOrigin : "50% 50%",
           }}
@@ -1079,25 +1359,32 @@ export function Preview({
           {playbackUrl && (
             <video
               ref={videoRef}
-              className="absolute inset-0 size-full object-contain"
-              preload="auto"
-              onLoadedMetadata={(event) =>
+              className={cn("absolute inset-0 size-full object-contain", showGap && "invisible")}
+              preload="metadata"
+              onLoadedMetadata={(event) => {
+                const video = event.currentTarget
+                video.playbackRate = Number(playbackSpeed)
+                if (video.videoWidth && video.videoHeight) setMediaAspect(video.videoWidth / video.videoHeight)
                 onLoadedMetadata({
                   duration: event.currentTarget.duration,
                   resolution: `${event.currentTarget.videoWidth} x ${event.currentTarget.videoHeight}`,
                 })
-              }
-              onTimeUpdate={(event) => onTimeUpdate(event.currentTarget.currentTime)}
-              onSeeking={() => setIsSeekingMedia(true)}
-              onSeeked={() => setIsSeekingMedia(false)}
+              }}
+              onSeeking={() => { presentedFrameRef.current = null; setSeekError(null); setIsSeekingMedia(true) }}
+              onSeeked={() => { if (seekMode !== "frame") setIsSeekingMedia(false) }}
               onError={(event) => {
+                frameStepsRef.current?.cancel()
+                pausedFrameTimeRef.current = null
                 const message = event.currentTarget.error?.message
                 if (message) setSeekError(message)
+                setIsSeekingMedia(false)
+                onEnded()
+                onPlaybackError()
               }}
-              onEnded={onEnded}
             />
           )}
           {/* overlays */}
+          {videoInfo.hasVideo === false && <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center gap-4 text-white/70"><Volume2 className="size-14" /><span>{videoInfo.filename}</span></div>}
           <div className="pointer-events-none absolute inset-0">
             <div className="pointer-events-auto absolute inset-0">
               {visibleAnnotations.map((a) => (
@@ -1108,14 +1395,15 @@ export function Preview({
                   activeTool={activeTool}
                   onClick={() => onSelectAnnotation(a.id)}
                   onMoveStart={handleMoveStart}
+                  unitScale={surfaceSize.height / 540}
                 />
               ))}
             </div>
           </div>
           {draft && <DraftOverlay draft={draft} />}
-          {isSeekingMedia && (
+          {!showGap && (isSeekingMedia || isReadingFrames) && (
             <div className="pointer-events-none absolute bottom-3 left-1/2 -translate-x-1/2 rounded-md bg-black/70 px-2 py-1 text-xs text-white">
-              Seeking…
+              {isReadingFrames ? "Reading frame timestamps…" : "Seeking…"}
             </div>
           )}
           {seekError && (
@@ -1137,7 +1425,8 @@ export function Preview({
         <Slider
           value={[currentTime]}
           min={0}
-          max={duration}
+          max={Math.max(frame, duration)}
+          disabled={duration <= 0}
           step={frame}
           onValueChange={(v) => onSeek(Array.isArray(v) ? v[0] : v, "preview")}
           onValueCommitted={(v) => onSeek(Array.isArray(v) ? v[0] : v, "precise")}
@@ -1154,7 +1443,7 @@ export function Preview({
           <ControlButton label="Back 5s" onClick={() => onSeek(Math.max(0, currentTime - 5))}>
             <Rewind className="size-4" />
           </ControlButton>
-          <ControlButton label="Previous frame" onClick={() => onSeek(Math.max(0, currentTime - frame))}>
+          <ControlButton label="Previous frame" disabled={videoInfo.hasVideo === false} onClick={() => requestFrameStep(-1)}>
             <SkipBack className="size-4" />
           </ControlButton>
         </div>
@@ -1171,7 +1460,7 @@ export function Preview({
         </div>
 
         <div className="flex flex-1 items-center justify-end gap-1">
-          <ControlButton label="Next frame" onClick={() => onSeek(Math.min(duration, currentTime + frame))}>
+          <ControlButton label="Next frame" disabled={videoInfo.hasVideo === false} onClick={() => requestFrameStep(1)}>
             <SkipForward className="size-4" />
           </ControlButton>
           <ControlButton label="Forward 5s" onClick={() => onSeek(Math.min(duration, currentTime + 5))}>

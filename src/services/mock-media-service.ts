@@ -69,6 +69,12 @@ function fileNameFromPath(path: string) {
 }
 
 export const mockMediaService: MediaService = {
+  async detectAccelerators() {
+    return { playbackCpu: true, settings: { mode: "cpu", deviceId: null }, checked: true, devices: [], usage: {}, diagnostic: "GPU processing is available in the desktop app." }
+  },
+  async setAccelerationSettings() {},
+  async getFrameStep() { throw new Error("Exact frame stepping requires a local video file in the desktop app.") },
+  async cancelFrameSteps() {},
   async openMedia(): Promise<OpenMediaResult | null> {
     const originalPath = "C:\\Videos\\summit_ascent_final.mp4"
     return {
@@ -133,6 +139,7 @@ export const mockMediaService: MediaService = {
   async cancelBackgroundMedia(): Promise<void> {
     return undefined
   },
+  async cancelTimelineThumbnails(): Promise<void> {},
 
   async setMediaPlaybackState(): Promise<void> {
     return undefined

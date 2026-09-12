@@ -1,11 +1,11 @@
 import type { Annotation, TimelineClip, TimelineMarker } from "@/lib/editor-types"
-import { formatClock } from "@/lib/editor-types"
-import type { ThumbnailState } from "@/types/media"
+import { clipAt, sourceTime } from "@/lib/timeline-edit"
+import type { AudioWaveformResult, ThumbnailState } from "@/types/media"
 import type { LodSelection } from "./lod-selector"
-import { alignTimeToLod } from "./lod-selector"
 import type { ThumbnailCache } from "./thumbnail-cache"
 import type { TimelineScale } from "./timeline-scale"
 import type { VisibleRange } from "./visible-range"
+import { RULER_HEIGHT, VIDEO_TRACK_TOP, VIDEO_TRACK_HEIGHT, audioTrackTop, subtitleTrackTop } from "./timeline-layout"
 import {
   ANNOTATION_LANE_HEIGHT,
   ANNOTATION_TRACK_HEIGHT,
@@ -26,13 +26,15 @@ export type TimelineRenderModel = {
   selectedId: string | null
   hasAudio: boolean
   hasSubtitles: boolean
-  audioPeaks: number[]
+  audioPeaks: AudioWaveformResult[]
   videoId: string
   range: VisibleRange
   scale: TimelineScale
   lod: LodSelection
   cache: ThumbnailCache
   states: Map<string, ThumbnailState>
+  mediaLabel?: string
+  hasVideo?: boolean
 }
 
 const colors = {
@@ -70,7 +72,7 @@ export function renderTimelineCanvas(canvas: HTMLCanvasElement, model: TimelineR
   drawVideoTrack(context, model, cssWidth)
   drawAnnotations(context, model)
   if (model.hasAudio) drawAudio(context, model, cssWidth)
-  if (model.hasSubtitles) drawSubtitles(context, cssWidth)
+  if (model.hasSubtitles) drawSubtitles(context, cssWidth, subtitleTrackTop(model.annotations.length > 0, model.hasAudio))
 }
 
 export function renderTimelinePlayhead(canvas: HTMLCanvasElement, model: TimelineRenderModel) {
@@ -94,161 +96,116 @@ function screenX(model: TimelineRenderModel, time: number) {
   return model.scale.timeToX(time) - model.range.scrollLeft
 }
 
+function rulerLabel(time: number, interval: number) {
+  const milliseconds = Math.round(time * 1000)
+  const wholeSeconds = Math.floor(milliseconds / 1000)
+  const hours = Math.floor(wholeSeconds / 3600)
+  const minutes = Math.floor(wholeSeconds / 60) % 60
+  const seconds = wholeSeconds % 60
+  const clock = (hours ? String(hours).padStart(2, "0") + ":" : "") + String(minutes).padStart(2, "0") + ":" + String(seconds).padStart(2, "0")
+  return interval < 1 ? clock + "." + String(milliseconds % 1000).padStart(3, "0") : clock
+}
+
 function drawRuler(context: CanvasRenderingContext2D, model: TimelineRenderModel, width: number) {
   context.fillStyle = "#151821"
-  context.fillRect(0, 0, width, 28)
-  context.strokeStyle = colors.border
+  context.fillRect(0, 0, width, RULER_HEIGHT)
+  const target = 96 / model.scale.pixelsPerSecond
+  const steps = [.05, .1, .25, .5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 14400]
+  const interval = steps.find(step => step >= target) ?? 3600 * Math.ceil(target / 3600)
+  const minor = model.lod.showFrameTicks ? model.scale.frameDuration : interval / 4
+  context.strokeStyle = colors.faint
   context.beginPath()
-  context.moveTo(0, 27.5)
-  context.lineTo(width, 27.5)
+  for (let index = Math.floor(model.range.visibleStart / minor); index * minor <= model.range.visibleEnd; index++) {
+    const x = Math.round(screenX(model, index * minor)) + .5
+    context.moveTo(x, RULER_HEIGHT - 5)
+    context.lineTo(x, RULER_HEIGHT)
+  }
   context.stroke()
-
-  const target = 80 / model.scale.pixelsPerSecond
-  const steps = [0.1, 0.25, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300]
-  const interval = steps.find((step) => step >= target) ?? 600
-  const start = alignTimeToLod(model.range.visibleStart, interval)
-
   context.font = "10px ui-monospace, SFMono-Regular, Menlo, monospace"
   context.textBaseline = "top"
-  for (let time = start; time <= model.range.visibleEnd + interval; time += interval) {
-    const x = screenX(model, time)
-    context.strokeStyle = colors.border
-    context.beginPath()
-    context.moveTo(x + 0.5, 0)
-    context.lineTo(x + 0.5, 9)
-    context.stroke()
+  for (let index = Math.floor(model.range.visibleStart / interval); index * interval <= model.range.visibleEnd; index++) {
+    const time = index * interval
+    const x = Math.round(screenX(model, time)) + .5
+    context.strokeStyle = colors.text
+    context.beginPath(); context.moveTo(x, RULER_HEIGHT - 9); context.lineTo(x, RULER_HEIGHT); context.stroke()
     context.fillStyle = colors.text
-    context.fillText(formatClock(time), x + 4, 11)
+    context.fillText(rulerLabel(time, interval), x + 5, 7)
   }
-
-  if (model.lod.showFrameTicks) {
-    const frameStart = Math.floor(model.range.visibleStart / model.scale.frameDuration)
-    const frameEnd = Math.ceil(model.range.visibleEnd / model.scale.frameDuration)
-    context.strokeStyle = colors.faint
-    context.beginPath()
-    for (let frame = frameStart; frame <= frameEnd; frame += 1) {
-      const x = screenX(model, frame * model.scale.frameDuration)
-      context.moveTo(x + 0.5, 18)
-      context.lineTo(x + 0.5, 27)
-    }
-    context.stroke()
-  }
-
+  context.strokeStyle = colors.border
+  context.beginPath(); context.moveTo(0, RULER_HEIGHT - .5); context.lineTo(width, RULER_HEIGHT - .5); context.stroke()
   for (const marker of model.markers) {
     const x = screenX(model, marker.time)
-    if (x < -20 || x > width + 20) continue
+    if (x < -10 || x > width + 10) continue
     context.fillStyle = marker.color
-    context.beginPath()
-    context.moveTo(x, 15)
-    context.lineTo(x + 6, 23)
-    context.lineTo(x, 28)
-    context.lineTo(x - 6, 23)
-    context.closePath()
-    context.fill()
+    context.beginPath(); context.moveTo(x, 20); context.lineTo(x + 5, 26); context.lineTo(x, 32); context.lineTo(x - 5, 26); context.closePath(); context.fill()
   }
+}
+
+function drawImageCover(context: CanvasRenderingContext2D, bitmap: ImageBitmap, x: number, y: number, width: number, height: number) {
+  const scale = Math.max(width / bitmap.width, height / bitmap.height)
+  const sourceWidth = width / scale
+  const sourceHeight = height / scale
+  context.drawImage(bitmap, (bitmap.width - sourceWidth) / 2, (bitmap.height - sourceHeight) / 2, sourceWidth, sourceHeight, x, y, width, height)
 }
 
 function drawVideoTrack(context: CanvasRenderingContext2D, model: TimelineRenderModel, width: number) {
-  const top = 34
-  const height = 40
-  drawTrackBackground(context, top, height, width)
-
-  const contentStartX = screenX(model, 0)
-  const contentEndX = screenX(model, model.duration)
-  const showClipEditing = !isImplicitFullTimelineClip(model)
-  const trimStart = Math.max(0, Math.min(model.duration, model.trim[0]))
-  const trimEnd = Math.max(trimStart, Math.min(model.duration, model.trim[1]))
-  const trimX = screenX(model, trimStart)
-  const trimWidth = Math.max(0, (trimEnd - trimStart) * model.scale.pixelsPerSecond)
-  if (showClipEditing) {
-    context.fillStyle = "rgba(125,211,252,0.12)"
-    context.strokeStyle = "rgba(125,211,252,0.55)"
-    roundedRect(context, trimX, top + 4, trimWidth, height - 8, 5)
-    context.fill()
-    context.stroke()
-  }
-
+  const top = VIDEO_TRACK_TOP
+  const height = VIDEO_TRACK_HEIGHT
   const interval = model.lod.intervalSeconds
-  const start = alignTimeToLod(model.range.requestStart, interval)
-
-  context.save()
-  context.beginPath()
-  context.rect(contentStartX, top + 5, Math.max(0, contentEndX - contentStartX), height - 10)
-  context.clip()
-
-  for (let time = start; time < model.duration && time <= model.range.requestEnd + interval; time += interval) {
-    const x = screenX(model, time)
-    const slotWidth = Math.max(0, Math.min(model.lod.thumbnailWidth, contentEndX - x))
-    if (slotWidth <= 0 || x > width + slotWidth || x + slotWidth < -slotWidth) continue
-
-    const exact = model.cache.get(model.videoId, interval, Math.round(time * 1000) / 1000)
-    const fallback =
-      exact ??
-      model.cache.getAtTimestamp(model.videoId, time) ??
-      model.cache.findNearest(model.videoId, interval, time, interval)
-    if (fallback) {
-      context.drawImage(fallback.bitmap, x, top + 5, slotWidth, height - 10)
-    } else {
-      drawLoadingSlot(context, model, x, top + 5, slotWidth, height - 10, time)
-    }
-  }
-  context.restore()
-
-  if (showClipEditing) drawClipBoundaries(context, model, top, height, width)
-
-  if (showClipEditing) {
-    context.fillStyle = colors.primary
-    context.fillRect(trimX, top + 4, 4, height - 8)
-    context.fillRect(Math.max(trimX, trimX + trimWidth - 4), top + 4, 4, height - 8)
-  }
-}
-
-function isImplicitFullTimelineClip(model: TimelineRenderModel) {
-  if (model.clips.length !== 1 || model.duration <= 0) return false
-  const [clip] = model.clips
-  return Math.abs(clip.startTime) < 0.001 && Math.abs(clip.endTime - model.duration) < 0.001
-}
-
-function drawClipBoundaries(
-  context: CanvasRenderingContext2D,
-  model: TimelineRenderModel,
-  top: number,
-  height: number,
-  viewportWidth: number,
-) {
-  context.font = "10px ui-sans-serif, system-ui"
-  context.textBaseline = "top"
-
+  const cellWidth = interval * model.scale.pixelsPerSecond
+  drawTrackBackground(context, top, height, width)
   for (const clip of model.clips) {
-    const x = screenX(model, clip.startTime)
-    const w = Math.max(1, (clip.endTime - clip.startTime) * model.scale.pixelsPerSecond)
-    if (x > viewportWidth + 20 || x + w < -20) continue
-
+    const left = screenX(model, clip.startTime)
+    const right = screenX(model, clip.endTime)
+    if (right <= 0 || left >= width || right <= left) continue
     const selected = clip.id === model.selectedClipId || model.selectedClipIds.includes(clip.id)
-    context.strokeStyle = selected ? "rgba(125,211,252,0.95)" : "rgba(255,255,255,0.28)"
-    context.lineWidth = selected ? 2 : 1
-    roundedRect(context, x, top + 4, w, height - 8, 5)
-    context.stroke()
-
-    context.fillStyle = selected ? "rgba(125,211,252,0.16)" : "rgba(255,255,255,0.05)"
-    roundedRect(context, x, top + 4, w, height - 8, 5)
-    context.fill()
-
-    context.fillStyle = selected ? colors.primary : colors.text
-    if (w > 42) {
-      context.fillText(clip.label, x + 7, top + 8)
+    context.save()
+    roundedRect(context, left + 1, top, Math.max(1, right - left - 2), height, 6)
+    context.clip()
+    context.fillStyle = model.hasVideo === false ? "#17352e" : "#253043"
+    context.fillRect(Math.max(0, left), top, Math.min(width, right) - Math.max(0, left), height)
+    if (model.hasVideo !== false) {
+      const first = Math.floor(Math.max(clip.startTime, model.range.visibleStart) / interval)
+      const last = Math.ceil(Math.min(clip.endTime, model.range.visibleEnd) / interval)
+      for (let index = first; index < last; index++) {
+        const time = index * interval
+        const x = screenX(model, time)
+        const source = Math.max(0, sourceTime(clip, Math.max(clip.startTime, time)))
+        const sample = Math.floor(source / interval) * interval
+        const exact = model.cache.getAtTimestamp(model.videoId, sample)
+        const image = exact ?? model.cache.findNearest(model.videoId, interval, sample, interval)
+        if (image) {
+          drawImageCover(context, image.bitmap, x, top + 20, cellWidth + .5, height - 20)
+          if (!exact) {
+            context.fillStyle = "rgba(16,24,39,.18)"
+            context.fillRect(x, top + 20, cellWidth + .5, height - 20)
+          }
+        } else drawLoadingSlot(context, model, x, top + 20, cellWidth + .5, height - 20, sample)
+      }
     }
-
-    context.strokeStyle = selected ? colors.primary : "rgba(255,255,255,0.45)"
-    context.beginPath()
-    context.moveTo(x + 0.5, top + 4)
-    context.lineTo(x + 0.5, top + height - 4)
-    context.moveTo(x + w + 0.5, top + 4)
-    context.lineTo(x + w + 0.5, top + height - 4)
-    context.stroke()
+    context.fillStyle = selected ? "#21506b" : "#293445"
+    context.fillRect(left, top, right - left, 20)
+    if (right - left > 45) {
+      const labelX = Math.max(left + 8, 8)
+      context.save(); context.beginPath(); context.rect(labelX, top, Math.max(0, Math.min(width, right) - labelX - 8), 20); context.clip()
+      context.font = "11px ui-sans-serif, system-ui"; context.textBaseline = "middle"
+      context.fillStyle = selected ? "#e0f5ff" : "#d4dce8"
+      const label = model.clips.length === 1 ? model.mediaLabel ?? clip.label : clip.label
+      context.fillText(label, labelX, top + 10)
+      context.restore()
+    }
+    context.restore()
+    context.strokeStyle = selected ? "#7dd3fc" : "rgba(211,224,242,.25)"
+    context.lineWidth = selected ? 2 : 1
+    roundedRect(context, left + 1, top + .5, Math.max(1, right - left - 2), height - 1, 6); context.stroke()
+    context.lineWidth = 1
   }
-
-  context.lineWidth = 1
+  for (const time of model.selectedClipId ? model.trim : []) {
+    const x = screenX(model, time)
+    if (x < -5 || x > width + 5) continue
+    context.fillStyle = colors.primary
+    roundedRect(context, x - 2, top + 2, 4, height - 4, 2); context.fill()
+  }
 }
 
 function drawLoadingSlot(
@@ -299,15 +256,15 @@ function drawAnnotations(context: CanvasRenderingContext2D, model: TimelineRende
 }
 
 function drawAudio(context: CanvasRenderingContext2D, model: TimelineRenderModel, width: number) {
-  const top = model.annotations.length > 0 ? 122 : 78
-  const height = 40
+  const top = audioTrackTop(model.annotations.length > 0)
+  const height = 48
   drawTrackBackground(context, top, height, width)
 
   const contentStartX = screenX(model, 0)
   const contentEndX = screenX(model, model.duration)
   const centerY = top + height / 2
   const minPixelStep = 3
-  const timeStep = Math.max(model.scale.frameDuration, minPixelStep / model.scale.pixelsPerSecond)
+  const timeStep = Math.max(0.005, minPixelStep / model.scale.pixelsPerSecond)
   const barWidth = Math.max(1, Math.min(3, timeStep * model.scale.pixelsPerSecond * 0.65))
   const start = Math.max(0, Math.floor(model.range.visibleStart / timeStep) * timeStep)
   const end = Math.min(model.duration, model.range.visibleEnd + timeStep)
@@ -327,7 +284,10 @@ function drawAudio(context: CanvasRenderingContext2D, model: TimelineRenderModel
     const x = screenX(model, time)
     if (x > width + barWidth || x + barWidth < -barWidth) continue
 
-    const energy = audioPeakAtTime(model, time)
+    const clip = clipAt(model.clips, time)
+    if (!clip) continue
+    const energy = audioPeakAtTime(model, sourceTime(clip, time), sourceTime(clip, Math.min(clip.endTime, time + timeStep)))
+    if (energy === null) continue
     // RMS values are naturally concentrated near zero. A square-root display
     // curve reveals useful loudness differences without changing cached audio.
     const visualEnergy = Math.sqrt(Math.max(0, Math.min(1, energy)))
@@ -337,20 +297,39 @@ function drawAudio(context: CanvasRenderingContext2D, model: TimelineRenderModel
   context.restore()
 }
 
-function audioPeakAtTime(model: TimelineRenderModel, time: number) {
-  if (model.duration <= 0 || model.audioPeaks.length === 0) return 0
-  const index = Math.min(
-    model.audioPeaks.length - 1,
-    Math.max(0, Math.floor((time / model.duration) * model.audioPeaks.length)),
-  )
-  return model.audioPeaks[index] ?? 0
+function audioPeakAtTime(model: TimelineRenderModel, time: number, end: number): number | null {
+  // Chunks are sorted once when the cache changes, instead of scanning every
+  // cached tile for every bar. Average energy when reusing a finer zoom level.
+  let low = 0
+  let high = model.audioPeaks.length
+  while (low < high) {
+    const middle = (low + high) >>> 1
+    if (model.audioPeaks[middle].endTime <= time) low = middle + 1
+    else high = middle
+  }
+  let energy = 0
+  let covered = 0
+  for (let tile = low; tile < model.audioPeaks.length; tile++) {
+    const chunk = model.audioPeaks[tile]
+    if (chunk.startTime >= end) break
+    if (!chunk.peaks.length || chunk.endTime <= chunk.startTime) continue
+    const step = (chunk.endTime - chunk.startTime) / chunk.peaks.length
+    const first = Math.max(0, Math.floor((time - chunk.startTime) / step))
+    const last = Math.min(chunk.peaks.length, Math.ceil((end - chunk.startTime) / step))
+    for (let index = first; index < last; index++) {
+      const overlap = Math.max(0, Math.min(end, chunk.startTime + (index + 1) * step) - Math.max(time, chunk.startTime + index * step))
+      energy += chunk.peaks[index] ** 2 * overlap
+      covered += overlap
+    }
+  }
+  return covered > 0 ? Math.sqrt(energy / covered) : null
 }
 
-function drawSubtitles(context: CanvasRenderingContext2D, width: number) {
-  drawTrackBackground(context, 166, 40, width)
+function drawSubtitles(context: CanvasRenderingContext2D, width: number, top: number) {
+  drawTrackBackground(context, top, 32, width)
   context.fillStyle = colors.text
   context.font = "11px ui-sans-serif, system-ui"
-  context.fillText("Subtitles", 12, 181)
+  context.fillText("Subtitles", 12, top + 12)
 }
 
 function drawPlayhead(context: CanvasRenderingContext2D, model: TimelineRenderModel, height: number) {

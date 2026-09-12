@@ -41,7 +41,7 @@ export function zoomAroundCursor(params: {
   cursorX: number
   scrollLeft: number
 }) {
-  const zoomFactor = params.deltaY < 0 ? 1.15 : 1 / 1.15
+  const zoomFactor = Math.exp(-clamp(params.deltaY, -160, 160) * 0.002)
   const nextPixelsPerSecond = clamp(
     params.currentPixelsPerSecond * zoomFactor,
     MIN_PIXELS_PER_SECOND,

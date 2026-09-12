@@ -13,6 +13,7 @@ import type {
   RuntimeMetrics,
   RuntimePerformanceConfig,
   TaskBudget,
+  FrameStep,
 } from "@/types/media"
 
 export type MediaServiceResult<T> = Promise<T>
@@ -20,15 +21,20 @@ export type MediaServiceResult<T> = Promise<T>
 export type ExportProgressHandler = (event: ExportProgressEvent) => void
 
 export type MediaService = {
+  detectAccelerators: () => MediaServiceResult<import("@/types/media").AccelerationStatus>
+  setAccelerationSettings: (settings: import("@/types/media").AccelerationSettings) => MediaServiceResult<void>
   openMedia: () => MediaServiceResult<OpenMediaResult | null>
   closeMedia: (playbackUrl: string | null) => MediaServiceResult<void>
   probeMedia: (inputPath: string) => MediaServiceResult<MediaProbe>
+  getFrameStep: (inputPath: string, time: number, direction: -1 | 1) => MediaServiceResult<FrameStep>
+  cancelFrameSteps: () => MediaServiceResult<void>
   preparePlayback: (inputPath: string) => MediaServiceResult<string>
   createVideoCacheId: (inputPath: string) => MediaServiceResult<string>
   generateTimelineThumbnailRange: (request: ThumbnailRequest) => MediaServiceResult<ThumbnailResult>
   generateAudioWaveform: (request: AudioWaveformRequest) => MediaServiceResult<AudioWaveformResult>
-  generatePlaybackProxy: (inputPath: string, videoId: string) => MediaServiceResult<string>
-  cancelBackgroundMedia: () => MediaServiceResult<void>
+  generatePlaybackProxy: (inputPath: string, videoId: string, forceCpu?: boolean) => MediaServiceResult<string>
+  cancelBackgroundMedia: (includeProxy?: boolean) => MediaServiceResult<void>
+  cancelTimelineThumbnails: () => MediaServiceResult<void>
   setMediaPlaybackState: (playing: boolean) => MediaServiceResult<void>
   getHardwareProfile: () => MediaServiceResult<HardwareProfile>
   getRuntimePerformanceConfig: () => MediaServiceResult<RuntimePerformanceConfig>

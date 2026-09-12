@@ -48,6 +48,8 @@ export interface Annotation {
 }
 
 export interface VideoInfo {
+  hasVideo?: boolean
+  variableFps?: boolean
   filename: string
   duration: number // seconds
   codec: string
@@ -71,6 +73,8 @@ export interface TimelineClip {
   label: string
   startTime: number
   endTime: number
+  /** Position in the original media; startTime/endTime are positions in the edit. */
+  sourceStart?: number
 }
 
 export function formatTimecode(seconds: number, fps = 30): string {

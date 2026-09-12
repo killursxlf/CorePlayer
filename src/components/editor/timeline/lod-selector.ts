@@ -1,5 +1,4 @@
-export const TARGET_THUMBNAIL_WIDTH = 120
-export const LOD_INTERVALS = [600, 300, 120, 60, 30, 15, 10, 5, 2, 1, 0.5, 0.25] as const
+export const TARGET_THUMBNAIL_WIDTH = 88
 
 export type LodSelection = {
   intervalSeconds: number
@@ -16,10 +15,10 @@ export function selectTimelineLod(pixelsPerSecond: number, fps: number): LodSele
   const safePixelsPerSecond = Math.max(0.001, pixelsPerSecond)
   const frameDuration = 1 / safeFps
   const desiredInterval = TARGET_THUMBNAIL_WIDTH / safePixelsPerSecond
-  const intervalSeconds = LOD_INTERVALS.reduce((best, candidate) =>
-    Math.abs(candidate - desiredInterval) < Math.abs(best - desiredInterval) ? candidate : best,
-  )
-  const thumbnailWidth = TARGET_THUMBNAIL_WIDTH
+  // Nested levels retain every other timestamp when zooming out. Cell width
+  // follows the time scale, so the filmstrip never develops holes/overlaps.
+  const intervalSeconds = Math.max(frameDuration, 2 ** Math.ceil(Math.log2(desiredInterval)))
+  const thumbnailWidth = intervalSeconds * safePixelsPerSecond
   const pixelsPerFrame = safePixelsPerSecond / safeFps
 
   return {

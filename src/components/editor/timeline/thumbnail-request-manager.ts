@@ -24,6 +24,24 @@ export class ThumbnailJobQueue {
   private readonly maxParallel: number
   private activeCount = 0
   private decodeConcurrency = 2
+  private disposed = false
+  private cancellationEpoch = 0
+  private videoId: string | null = null
+  private viewport: {start: number; end: number; interval: number} | null = null
+  private updateFrame: number | null = null
+
+  setViewport(videoId: string, start: number, end: number, interval: number) {
+    if (this.videoId !== videoId) {
+      this.cancellationEpoch += 1
+      this.cache.clear()
+      this.queued.clear()
+      this.states.clear()
+      this.cacheDir = null
+    }
+    this.videoId = videoId
+    this.viewport = {start, end, interval}
+    this.cache.protectVisible(videoId, start, end)
+  }
 
   constructor(
     service: MediaService,
@@ -46,25 +64,43 @@ export class ThumbnailJobQueue {
   }
 
   request(request: ThumbnailRequest, priority = 0) {
+    if (this.disposed) return
+    this.videoId ??= request.videoId
+    if (this.videoId !== request.videoId || request.generation < this.generation) return
     this.generation = request.generation
     this.removeStaleQueued(request.generation)
 
     const key = this.makeRequestKey(request)
-    if (this.queued.has(key) || this.running.has(key)) return
+    if (this.queued.has(key)) return
 
     this.queued.set(key, { request, priority, key })
     this.setRangeState(request, "queued")
     this.pump()
   }
 
-  cancelQueuedBefore(generation: number) {
+  cancelQueuedBefore(generation: number, options: { reuseInFlight?: boolean } = {}) {
     this.generation = generation
+    if (!options.reuseInFlight) {
+      this.cancellationEpoch += 1
+    }
     this.removeStaleQueued(generation)
+    this.states.clear()
+    if (this.updateFrame !== null) cancelAnimationFrame(this.updateFrame)
+    this.updateFrame = null
     this.onUpdate(this.status())
   }
 
+  dispose() {
+    this.disposed = true
+    this.generation += 1
+    this.queued.clear()
+    this.states.clear()
+    if (this.updateFrame !== null) cancelAnimationFrame(this.updateFrame)
+    this.updateFrame = null
+  }
+
   private pump() {
-    while (this.activeCount < this.maxParallel && this.queued.size > 0) {
+    while (!this.disposed && this.activeCount < this.maxParallel && this.queued.size > 0) {
       const next = [...this.queued.values()].sort((a, b) => b.priority - a.priority)[0]
       this.queued.delete(next.key)
       this.running.add(next.key)
@@ -79,32 +115,44 @@ export class ThumbnailJobQueue {
   }
 
   private async run(item: QueueItem) {
+    const cancellationEpoch = this.cancellationEpoch
     try {
-      const result = await this.service.generateTimelineThumbnailRange(item.request)
-      this.cacheDir = result.cacheDir
-
-      if (result.generation !== this.generation) {
+      const times: number[] = []
+      for (let time = item.request.startTime; time <= item.request.endTime + .00001; time += item.request.intervalSeconds) times.push(time)
+      if (times.every(time => this.cache.getAtTimestamp(item.request.videoId, time))) {
+        if (item.request.generation === this.generation) this.setRangeState(item.request, "ready")
         return
       }
+      const result = await this.service.generateTimelineThumbnailRange(item.request)
+      if (!this.acceptsResult(result.videoId, cancellationEpoch)) {
+        return
+      }
+      this.cacheDir = result.cacheDir
+      if (result.generation === this.generation) this.setRangeState(item.request, "missing")
 
       let nextIndex = 0
       const decodeWorker = async () => {
         while (nextIndex < result.thumbnails.length) {
           const thumbnail = result.thumbnails[nextIndex]
           nextIndex += 1
-          if (result.generation !== this.generation) return
+          if (!this.acceptsResult(result.videoId, cancellationEpoch)) return
+          const viewport = this.viewport
+          const margin = Math.max(result.intervalSeconds * 2, (viewport?.interval ?? 0) * 2,
+            viewport ? (viewport.end - viewport.start) * .75 : 0)
+          if (viewport && (thumbnail.time < viewport.start - margin || thumbnail.time > viewport.end + margin)) continue
           const stateKey = this.makeStateKey(
             result.videoId,
             result.intervalSeconds,
             thumbnail.time,
           )
-          const state = thumbnail.state === "error" ? "missing" : thumbnail.state
-          this.states.set(stateKey, state)
-          if (thumbnail.state !== "ready") return
+          if (thumbnail.state !== "ready") {
+            if (result.generation === this.generation) this.states.set(stateKey, "missing")
+            continue
+          }
 
           try {
             const bitmap = await loadBitmapFromUrl(thumbnail.path)
-            if (result.generation !== this.generation) {
+            if (!this.acceptsResult(result.videoId, cancellationEpoch)) {
               bitmap.close()
               return
             }
@@ -115,20 +163,25 @@ export class ThumbnailJobQueue {
               bitmap,
               thumbnail.path,
             )
+            this.states.set(stateKey, "ready")
+            this.notify()
           } catch {
-            this.states.set(stateKey, "missing")
+            if (this.acceptsResult(result.videoId, cancellationEpoch) && result.generation === this.generation) this.states.set(stateKey, "missing")
           }
-          await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
         }
       }
       await Promise.all(
         Array.from({ length: this.decodeConcurrency }, () => decodeWorker()),
       )
     } catch {
-      this.setRangeState(item.request, "missing")
+      if (this.acceptsResult(item.request.videoId, cancellationEpoch) && item.request.generation === this.generation) this.setRangeState(item.request, "missing")
     } finally {
-      this.onUpdate(this.status())
+      if (this.acceptsResult(item.request.videoId, cancellationEpoch)) this.notify()
     }
+  }
+
+  private acceptsResult(videoId: string, cancellationEpoch: number) {
+    return !this.disposed && videoId === this.videoId && cancellationEpoch === this.cancellationEpoch
   }
 
   private setRangeState(request: ThumbnailRequest, state: ThumbnailState) {
@@ -138,7 +191,15 @@ export class ThumbnailJobQueue {
         state,
       )
     }
-    this.onUpdate(this.status())
+    this.notify()
+  }
+
+  private notify() {
+    if (this.disposed || this.updateFrame !== null) return
+    this.updateFrame = requestAnimationFrame(() => {
+      this.updateFrame = null
+      if (!this.disposed) this.onUpdate(this.status())
+    })
   }
 
   private removeStaleQueued(generation: number) {
@@ -155,7 +216,6 @@ export class ThumbnailJobQueue {
       Math.round(request.intervalSeconds * 1000),
       request.thumbnailWidth,
       request.thumbnailHeight,
-      request.generation,
     ].join(":")
   }
 
@@ -164,6 +224,11 @@ export class ThumbnailJobQueue {
   }
 
   private status(): TimelineThumbnailStatus {
+    while (this.states.size > 2000) {
+      const key = this.states.keys().next().value
+      if (key == null) break
+      this.states.delete(key)
+    }
     return {
       generation: this.generation,
       cacheDir: this.cacheDir,

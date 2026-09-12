@@ -38,13 +38,14 @@ const TOOLS: { id: ToolId; label: string; icon: LucideIcon; key?: string }[] = [
 ]
 
 interface ToolSidebarProps {
+  annotationsDisabled?: boolean
   active: ToolId
   onSelect: (id: ToolId) => void
   collapsed: boolean
   onToggleCollapse: () => void
 }
 
-export function ToolSidebar({ active, onSelect, collapsed, onToggleCollapse }: ToolSidebarProps) {
+export function ToolSidebar({ active, onSelect, collapsed, onToggleCollapse, annotationsDisabled }: ToolSidebarProps) {
   return (
     <aside
       className={cn(
@@ -77,9 +78,10 @@ export function ToolSidebar({ active, onSelect, collapsed, onToggleCollapse }: T
           const button = (
             <button
               type="button"
+              disabled={annotationsDisabled && tool.id !== "select"}
               onClick={() => onSelect(tool.id)}
               className={cn(
-                "group flex items-center rounded-lg text-sm transition-colors",
+                "group flex items-center rounded-lg text-sm transition-colors disabled:opacity-40 disabled:pointer-events-none",
                 collapsed ? "size-8 justify-center" : "h-9 w-full gap-2.5 px-2.5",
                 isActive
                   ? "bg-primary text-primary-foreground shadow-sm"

@@ -1,10 +1,13 @@
 "use client"
 
 import { Play, Pause, Upload, Check, CircleDot } from "lucide-react"
+import { AccelerationSettingsPanel } from "./acceleration-settings-panel"
 
 interface StatusBarProps {
   hasMedia: boolean
   currentFrame: number
+  variableFps?: boolean
+  currentTime: number
   fps: number
   isPlaying: boolean
   saved: boolean
@@ -34,6 +37,8 @@ function Item({
 export function StatusBar({
   hasMedia,
   currentFrame,
+  variableFps,
+  currentTime,
   fps,
   isPlaying,
   saved,
@@ -46,9 +51,9 @@ export function StatusBar({
         <Item>No media loaded</Item>
       ) : (
         <>
-          <Item>Frame {currentFrame}</Item>
+          <Item>{variableFps ? `Time ${currentTime.toFixed(6)} s` : `Frame ${currentFrame}`}</Item>
           <div className="h-3 w-px bg-border" />
-          <Item>{fps.toFixed(2)} fps</Item>
+          <Item>{fps.toFixed(2)} fps{variableFps ? " (variable)" : ""}</Item>
         </>
       )}
       <div className="h-3 w-px bg-border" />
@@ -60,6 +65,7 @@ export function StatusBar({
       </Item>
 
       <div className="ml-auto flex items-center gap-4">
+        <AccelerationSettingsPanel />
         <Item icon={<Upload className="size-3" />} tone={exportStatus === "Ready" ? "muted" : "warn"}>
           Export: {exportStatus}
           {exportStatus !== "Ready" && ` ${Math.round(exportProgress * 100)}%`}

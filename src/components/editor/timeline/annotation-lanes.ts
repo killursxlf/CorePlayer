@@ -1,6 +1,7 @@
 import type { Annotation } from "@/lib/editor-types"
+import { RULER_HEIGHT, VIDEO_ROW_HEIGHT } from "./timeline-layout"
 
-export const ANNOTATION_TRACK_TOP = 78
+export const ANNOTATION_TRACK_TOP = RULER_HEIGHT + VIDEO_ROW_HEIGHT + 4
 export const ANNOTATION_TRACK_HEIGHT = 40
 export const ANNOTATION_LANE_COUNT = 3
 export const ANNOTATION_LANE_HEIGHT = 10

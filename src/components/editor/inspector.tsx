@@ -1,5 +1,6 @@
 "use client"
 
+import { parseTimecode } from "@/utils/time"
 import { Info, SlidersHorizontal, Eye, EyeOff, Trash2, X } from "lucide-react"
 import type { Annotation, VideoInfo } from "@/lib/editor-types"
 import { formatClock, formatTimecode } from "@/lib/editor-types"
@@ -23,6 +24,8 @@ const FONTS = ["Inter", "Geist", "Roboto", "Arial", "Mono"]
 interface InspectorProps {
   videoInfo: VideoInfo
   selected: Annotation | null
+  onEditStart: () => void
+  onEditEnd: () => void
   onChange: (patch: Partial<Annotation>) => void
   onDelete: () => void
   onClose: () => void
@@ -72,9 +75,9 @@ function Section({ title, children }: { title: string; children: React.ReactNode
   )
 }
 
-export function Inspector({ videoInfo, selected, onChange, onDelete, onClose }: InspectorProps) {
+export function Inspector({ videoInfo, selected, onEditStart, onEditEnd, onChange, onDelete, onClose }: InspectorProps) {
   return (
-    <aside className="flex w-72 flex-col border-l border-border bg-sidebar">
+    <aside onPointerDownCapture={onEditStart} onFocusCapture={onEditStart} onBlurCapture={onEditEnd} className="flex w-72 flex-col border-l border-border bg-sidebar">
       <div className="flex h-10 items-center gap-2 border-b border-border px-4">
         {selected ? (
           <SlidersHorizontal className="size-4 text-primary" />
@@ -131,6 +134,10 @@ export function Inspector({ videoInfo, selected, onChange, onDelete, onClose }: 
           <>
             <Section title="Appearance">
               <div className="space-y-3">
+                <div className="space-y-1.5">
+                  <Label htmlFor="annotation-label" className="text-xs text-muted-foreground">{selected.type === "text" ? "Text" : "Label"}</Label>
+                  <Input id="annotation-label" value={selected.label} onChange={event => { onEditStart(); onChange({label: event.currentTarget.value}) }} />
+                </div>
                 <div className="space-y-1.5">
                   <Label className="text-xs text-muted-foreground">Color</Label>
                   <div className="flex flex-wrap gap-1.5">
@@ -216,12 +223,18 @@ export function Inspector({ videoInfo, selected, onChange, onDelete, onClose }: 
                 <div className="space-y-1.5">
                   <Label className="text-xs text-muted-foreground">Start</Label>
                   <Input
-                    value={formatTimecode(selected.startTime, videoInfo.fps)}
-                    onChange={(e) => {
-                      const parts = e.target.value.split(":").map(Number)
-                      if (parts.length === 4 && parts.every((n) => !Number.isNaN(n))) {
-                        onChange({ startTime: parts[0] * 3600 + parts[1] * 60 + parts[2] + parts[3] / videoInfo.fps })
-                      }
+                    key={selected.id + ":startTime:" + selected.startTime}
+                    aria-label="Annotation start time"
+                    defaultValue={formatTimecode(selected.startTime, videoInfo.fps)}
+                    disabled={selected.type === "crop"}
+                    onBlur={event => {
+                      const time = parseTimecode(event.currentTarget.value, videoInfo.fps)
+                      if (time !== null && time >= 0 && time <= selected.endTime - 0.001 && time !== selected.startTime) onChange({startTime: time})
+                      else event.currentTarget.value = formatTimecode(selected.startTime, videoInfo.fps)
+                    }}
+                    onKeyDown={event => {
+                      if (event.key === "Escape") event.currentTarget.value = formatTimecode(selected.startTime, videoInfo.fps)
+                      if (event.key === "Enter" || event.key === "Escape") event.currentTarget.blur()
                     }}
                     className="h-8 font-mono text-xs"
                   />
@@ -229,12 +242,18 @@ export function Inspector({ videoInfo, selected, onChange, onDelete, onClose }: 
                 <div className="space-y-1.5">
                   <Label className="text-xs text-muted-foreground">End</Label>
                   <Input
-                    value={formatTimecode(selected.endTime, videoInfo.fps)}
-                    onChange={(e) => {
-                      const parts = e.target.value.split(":").map(Number)
-                      if (parts.length === 4 && parts.every((n) => !Number.isNaN(n))) {
-                        onChange({ endTime: parts[0] * 3600 + parts[1] * 60 + parts[2] + parts[3] / videoInfo.fps })
-                      }
+                    key={selected.id + ":endTime:" + selected.endTime}
+                    aria-label="Annotation end time"
+                    defaultValue={formatTimecode(selected.endTime, videoInfo.fps)}
+                    disabled={selected.type === "crop"}
+                    onBlur={event => {
+                      const time = parseTimecode(event.currentTarget.value, videoInfo.fps)
+                      if (time !== null && time >= selected.startTime + 0.001 && time <= videoInfo.duration && time !== selected.endTime) onChange({endTime: time})
+                      else event.currentTarget.value = formatTimecode(selected.endTime, videoInfo.fps)
+                    }}
+                    onKeyDown={event => {
+                      if (event.key === "Escape") event.currentTarget.value = formatTimecode(selected.endTime, videoInfo.fps)
+                      if (event.key === "Enter" || event.key === "Escape") event.currentTarget.blur()
                     }}
                     className="h-8 font-mono text-xs"
                   />

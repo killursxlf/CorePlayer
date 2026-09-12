@@ -6,11 +6,15 @@ export type MediaProbe = {
   timeBase?: string
   rotation?: number
   hasAudio?: boolean
+  hasVideo?: boolean
   variableFps?: boolean
   bitrate?: string
   audioStreams?: string
   subtitles?: string
 }
+
+export type SeekMode = "preview" | "precise" | "frame"
+export type FrameStep = { time: number; seekTime: number; atBoundary: boolean; editClipId?: string }
 
 export type OpenMediaResult = {
   originalPath: string
@@ -27,6 +31,7 @@ export type PlaybackRegistration = {
 }
 
 export type AudioWaveformRequest = {
+  cacheOnly?: boolean
   videoId: string
   filePath: string
   startTime: number
@@ -111,6 +116,7 @@ export type HardwareProfile = {
   totalRamBytes?: number
   availableRamBytes?: number
   onBattery?: boolean
+  batterySaver?: boolean
   hardwareDecodeAvailable?: boolean
 }
 
@@ -130,6 +136,8 @@ export type TaskBudget = {
 }
 
 export type RuntimePerformanceConfig = {
+  acceleration?: AccelerationStatus
+  playbackProxy?: { videoId: string; progress: number } | null
   hardware: HardwareProfile
   preset: PerformancePreset
   pressure: PressureLevel
@@ -142,7 +150,18 @@ export type RuntimePerformanceConfig = {
   waveformBudget: TaskBudget
 }
 
+export type AccelerationSettings = { mode: "auto" | "gpu" | "cpu"; deviceId: string | null }
+export type AccelerationStatus = {
+  playbackCpu: boolean
+  settings: AccelerationSettings
+  checked: boolean
+  diagnostic: string | null
+  devices: Array<{ id: string; name: string; vendor: string; encoders: string[]; decoders: string[]; diagnostics: string[] }>
+  usage: Record<string, { task: string; accelerator: string; reason: string | null }>
+}
+
 export type RuntimeMetrics = {
+  uiLongTaskRatio?: number
   droppedFrameRatio: number
   userActive: boolean
   windowVisible: boolean

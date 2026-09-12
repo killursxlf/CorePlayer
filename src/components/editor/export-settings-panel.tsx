@@ -1,5 +1,6 @@
 "use client"
 
+import { compatibleExportSettings } from "@/lib/export-settings"
 import { X } from "lucide-react"
 import type { TimelineClip } from "@/lib/editor-types"
 import type { ExportSettings } from "@/types/export"
@@ -7,7 +8,7 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 
-type ExportScope = "selected" | "all"
+type ExportScope = "timeline" | "selected" | "all"
 
 interface ExportSettingsPanelProps {
   open: boolean
@@ -56,8 +57,8 @@ export function ExportSettingsPanel({
   const selectedClip = clips.find((clip) => clip.id === selectedClipId) ?? clips[0]
   const selectedSet = new Set(selectedClipIds.length > 0 ? selectedClipIds : selectedClipId ? [selectedClipId] : [])
   const selectedClips = clips.filter((clip) => selectedSet.has(clip.id))
-  const exportCount = scope === "all" ? clips.length : selectedClips.length
-  const update = (patch: Partial<ExportSettings>) => onSettingsChange({ ...settings, ...patch })
+  const exportCount = scope !== "selected" ? clips.length : selectedClips.length
+  const update = (patch: Partial<ExportSettings>) => onSettingsChange(compatibleExportSettings({ ...settings, ...patch }))
 
   return (
     <div className="absolute inset-0 z-40 flex items-center justify-center bg-background/70 p-4 backdrop-blur-sm">
@@ -87,6 +88,7 @@ export function ExportSettingsPanel({
                 onChange={(event) => onScopeChange(event.currentTarget.value as ExportScope)}
                 className="h-8 w-full rounded-lg border border-input bg-background px-2 text-sm"
               >
+                <option value="timeline">Весь монтаж одним файлом</option>
                 <option value="selected">Selected clips</option>
                 <option value="all">All clips as separate files</option>
               </select>
@@ -112,14 +114,17 @@ export function ExportSettingsPanel({
                 onChange={(event) => update({ mode: event.currentTarget.value as ExportSettings["mode"] })}
                 className="h-8 w-full rounded-lg border border-input bg-background px-2 text-sm"
               >
-                <option value="stream-copy">Fast stream copy</option>
+                <option value="stream-copy" disabled={settings.format === "webm"}>Fast stream copy (keyframe cuts)</option>
                 <option value="encode">Encode with settings</option>
               </select>
             </Field>
 
             <div className="rounded-lg border border-border bg-secondary/30 p-3 text-xs leading-5 text-muted-foreground">
-              Stream copy is fastest but can only preserve original codecs. Encode mode applies bitrate, FPS,
-              resolution, CRF, and codec settings.
+              {scope === "timeline" && <p className="mb-2">Монтаж экспортируется одним файлом с аннотациями и всеми аудиодорожками. Разрывы сохраняются как чёрный экран и тишина. Видео и звук перекодируются; COPY автоматически заменяется совместимым кодировщиком.</p>}
+              Encode for precise cuts. Stream copy starts near a keyframe and may include extra footage.
+              Video codec COPY has the same limitation. Annotations require video re-encoding in either mode.
+              All audio streams are retained; source subtitles are not included. Crop applies to the whole clip.
+              Multiple clips produce separate files; use a new name if those files already exist.
             </div>
           </div>
 
@@ -131,7 +136,7 @@ export function ExportSettingsPanel({
                 disabled={settings.mode === "stream-copy"}
                 className="h-8 w-full rounded-lg border border-input bg-background px-2 text-sm disabled:opacity-50"
               >
-                {videoCodecs.map((codec) => (
+                {videoCodecs.filter(codec => settings.format !== "webm" || codec === "vp9" || codec === "av1").map((codec) => (
                   <option key={codec} value={codec}>
                     {codec.toUpperCase()}
                   </option>
@@ -146,7 +151,7 @@ export function ExportSettingsPanel({
                 disabled={settings.mode === "stream-copy"}
                 className="h-8 w-full rounded-lg border border-input bg-background px-2 text-sm disabled:opacity-50"
               >
-                {audioCodecs.map((codec) => (
+                {audioCodecs.filter(codec => settings.format !== "webm" || codec === "opus").map((codec) => (
                   <option key={codec} value={codec}>
                     {codec.toUpperCase()}
                   </option>

@@ -1,6 +1,10 @@
 "use client"
 
 import { useCallback, useEffect, useRef, useState } from "react"
+import { usePlaybackProxy } from "@/hooks/use-playback-proxy"
+import { clipAt, deleteRanges, editDuration, moveClips, moveRanges, sourceStart, splitClip, trimClip, type TimeRange, type TimelineContent } from "@/lib/timeline-edit"
+import { isTauri } from "@tauri-apps/api/core"
+import { getCurrentWindow } from "@tauri-apps/api/window"
 import { LoaderCircle, PanelRightOpen } from "lucide-react"
 import { MenuBar } from "@/components/editor/menu-bar"
 import { Toolbar } from "@/components/editor/toolbar"
@@ -26,8 +30,9 @@ import { playbackClock } from "@/stores/playback-clock"
 import { createAppError } from "@/types/app-error"
 import { isValidTrimRange } from "@/utils/time"
 import type { Annotation, TimelineClip, TimelineMarker, ToolId, VideoInfo } from "@/lib/editor-types"
+import { DEFAULT_EXPORT_SETTINGS } from "@/lib/export-settings"
 import type { ExportSettings } from "@/types/export"
-import type { OpenMediaResult, RuntimeMetrics } from "@/types/media"
+import type { OpenMediaResult, RuntimeMetrics, SeekMode } from "@/types/media"
 
 const EMPTY_VIDEO_INFO: VideoInfo = {
   filename: "No media selected",
@@ -45,21 +50,10 @@ const INITIAL_ANNOTATIONS: Annotation[] = []
 
 const INITIAL_MARKERS: TimelineMarker[] = []
 const PLAYBACK_SPEEDS = [0.25, 0.5, 1, 1.5, 2] as const
-const DEFAULT_EXPORT_SETTINGS: ExportSettings = {
-  format: "mp4",
-  mode: "stream-copy",
-  videoCodec: "h264",
-  audioCodec: "aac",
-  videoBitrateKbps: null,
-  audioBitrateKbps: 192,
-  fps: null,
-  width: null,
-  height: null,
-  crf: 20,
-  preset: "medium",
-}
 
 type ProjectSnapshot = {
+  selectedRange: TimeRange | null
+  playhead: number
   annotations: Annotation[]
   markers: TimelineMarker[]
   clips: TimelineClip[]
@@ -71,7 +65,7 @@ type ProjectSnapshot = {
 }
 
 function cloneAnnotations(annotations: Annotation[]) {
-  return annotations.map((annotation) => ({ ...annotation }))
+  return structuredClone(annotations)
 }
 
 function cloneMarkers(markers: TimelineMarker[]) {
@@ -138,9 +132,26 @@ function App() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [zoom, setZoom] = useState(100)
   const [saved, setSaved] = useState(true)
+  const editRevisionRef = useRef(0)
+  const projectVersionRef = useRef(0)
+  const projectSaveQueueRef = useRef<Promise<void>>(Promise.resolve())
+  const transitionRef = useRef(false)
+  const [discardDialog, setDiscardDialog] = useState(false)
+  const discardResolverRef = useRef<((choice: "save" | "discard" | "cancel") => void) | null>(null)
+  const gestureRef = useRef<{ snapshot: ProjectSnapshot; recorded: boolean } | null>(null)
+  const markUnsaved = useCallback(() => {
+    editRevisionRef.current += 1
+    setSaved(false)
+  }, [])
+  const answerDiscard = useCallback((choice: "save" | "discard" | "cancel") => {
+    setDiscardDialog(false)
+    discardResolverRef.current?.(choice)
+    discardResolverRef.current = null
+  }, [])
   const [projectPath, setProjectPath] = useState<string | null>(null)
   const [exportOperationId, setExportOperationId] = useState<string | null>(null)
   const [mediaDetails, setMediaDetails] = useState<VideoInfo>(EMPTY_VIDEO_INFO)
+  const [mediaSession, setMediaSession] = useState(0)
   const [inspectorOpen, setInspectorOpen] = useState(true)
   const [timelineVisible, setTimelineVisible] = useState(true)
   const [videoCacheId, setVideoCacheId] = useState<string | null>(null)
@@ -148,23 +159,26 @@ function App() {
   const [recentMediaPath, setRecentMediaPath] = useState<string | null>(null)
   const [exportSettingsOpen, setExportSettingsOpen] = useState(false)
   const [exportSettings, setExportSettings] = useState<ExportSettings>(DEFAULT_EXPORT_SETTINGS)
-  const [exportScope, setExportScope] = useState<"selected" | "all">("selected")
+  const [exportScope, setExportScope] = useState<"timeline" | "selected" | "all">("timeline")
   const undoStackRef = useRef<ProjectSnapshot[]>([])
   const redoStackRef = useRef<ProjectSnapshot[]>([])
   const annotationClipboardRef = useRef<Annotation | null>(null)
   const lastPressureRef = useRef<string | null>(null)
-  const proxyAttemptRef = useRef<string | null>(null)
   const [historyVersion, setHistoryVersion] = useState(0)
 
   const [annotations, setAnnotations] = useState<Annotation[]>(INITIAL_ANNOTATIONS)
   const [markers, setMarkers] = useState<TimelineMarker[]>(INITIAL_MARKERS)
   const [clips, setClips] = useState<TimelineClip[]>([])
+  const [selectedRange, setSelectedRange] = useState<TimeRange | null>(null)
+  const [rippleDelete, setRippleDelete] = useState(true)
   const [selectedClipId, setSelectedClipId] = useState<string | null>(null)
   const [selectedClipIds, setSelectedClipIds] = useState<string[]>([])
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [pxPerSecond, setPxPerSecond] = useState(14)
   const [seekRevision, setSeekRevision] = useState(0)
-  const [seekMode, setSeekMode] = useState<"preview" | "precise">("precise")
+  const [seekTarget, setSeekTarget] = useState(0)
+  const [seekMode, setSeekMode] = useState<SeekMode>("precise")
+  const [seekFrameTime, setSeekFrameTime] = useState<number | null>(null)
   const previewSeekTimerRef = useRef<number | null>(null)
   const pendingPreviewSeekRef = useRef<number | null>(null)
   const lastPreviewSeekAtRef = useRef(0)
@@ -202,8 +216,8 @@ function App() {
 
   const mediaService = getMediaService()
   const hasMedia = Boolean(originalPath && playbackUrl)
-  const effectiveDuration = hasMedia && duration > 0 ? duration : 0
-  const selectedClip = clips.find((clip) => clip.id === selectedClipId) ?? clips[0] ?? null
+  const effectiveDuration = hasMedia ? editDuration(clips) : 0
+  const selectedClip = clips.find((clip) => clip.id === selectedClipId) ?? null
   const trim: [number, number] = selectedClip
     ? [selectedClip.startTime, selectedClip.endTime]
     : [trimStart, trimEnd ?? effectiveDuration]
@@ -243,49 +257,18 @@ function App() {
     [mediaService, setPerformanceConfig],
   )
 
-  useEffect(() => {
-    if (
-      !originalPath ||
-      !videoCacheId ||
-      !benefitsFromPlaybackProxy(videoInfo.codec, videoInfo.resolution, videoInfo.bitrate) ||
-      performanceConfig?.hardware.hardwareDecodeAvailable !== false ||
-      proxyAttemptRef.current === originalPath
-    ) {
-      return
-    }
-    proxyAttemptRef.current = originalPath
-    let cancelled = false
-    void mediaService
-      .generatePlaybackProxy(originalPath, videoCacheId)
-      .then(async (proxyPath) => {
-        const proxyUrl = await mediaService.preparePlayback(proxyPath)
-        if (cancelled || useMediaStore.getState().originalPath !== originalPath) {
-          await mediaService.closeMedia(proxyUrl)
-          return
-        }
-        const previousUrl = useMediaStore.getState().playbackUrl
-        const resumeAt = playbackClock.getSnapshot()
-        setPlaybackUrl(proxyUrl)
-        setCurrentTime(resumeAt)
-        setSeekMode("precise")
-        setSeekRevision((revision) => revision + 1)
-        if (previousUrl) await mediaService.closeMedia(previousUrl)
-      })
-      .catch(() => undefined)
-    return () => {
-      cancelled = true
-    }
-  }, [
-    mediaService,
-    originalPath,
-    performanceConfig?.hardware.hardwareDecodeAvailable,
-    setCurrentTime,
-    setPlaybackUrl,
-    videoCacheId,
-    videoInfo.bitrate,
-    videoInfo.codec,
-    videoInfo.resolution,
-  ])
+  const switchPlaybackCopy = useCallback((url: string) => {
+    const resumeAt = playbackClock.getSnapshot()
+    setPlaybackUrl(url)
+    setCurrentTime(resumeAt)
+    setSeekTarget(resumeAt)
+    setSeekMode("precise")
+    setSeekRevision(revision => revision + 1)
+  }, [setCurrentTime, setPlaybackUrl])
+  const playbackCopy = usePlaybackProxy(mediaService, originalPath, videoCacheId, mediaSession,
+    videoInfo.hasVideo !== false && benefitsFromPlaybackProxy(videoInfo.codec, videoInfo.resolution, videoInfo.bitrate)
+      && (performanceConfig?.hardware.hardwareDecodeAvailable === false || (performanceConfig?.droppedFrameRatio ?? 0) >= 0.03),
+    isPlaying, switchPlaybackCopy)
 
   const fileNameFromPath = useCallback((path: string) => path.split(/[\\/]/).pop() || path, [])
 
@@ -298,15 +281,17 @@ function App() {
   )
 
   const handleUserSeek = useCallback(
-    (time: number, mode: "preview" | "precise" = "precise") => {
-      synchronizePlaybackTime(time)
-      if (mode === "precise") {
+    (time: number, mode: SeekMode = "precise", frameTime?: number) => {
+      synchronizePlaybackTime(frameTime ?? time)
+      setSeekFrameTime(mode === "frame" ? frameTime ?? null : null)
+      if (mode !== "preview") {
+        setSeekTarget(time)
         pendingPreviewSeekRef.current = null
         if (previewSeekTimerRef.current != null) {
           window.clearTimeout(previewSeekTimerRef.current)
           previewSeekTimerRef.current = null
         }
-        setSeekMode("precise")
+        setSeekMode(mode)
         setSeekRevision((revision) => revision + 1)
         return
       }
@@ -317,6 +302,7 @@ function App() {
       previewSeekTimerRef.current = window.setTimeout(() => {
         previewSeekTimerRef.current = null
         if (pendingPreviewSeekRef.current == null) return
+        setSeekTarget(pendingPreviewSeekRef.current)
         pendingPreviewSeekRef.current = null
         lastPreviewSeekAtRef.current = performance.now()
         setSeekMode("preview")
@@ -337,6 +323,8 @@ function App() {
 
   const createSnapshot = useCallback(
     (): ProjectSnapshot => ({
+      selectedRange,
+      playhead: playbackClock.getSnapshot(),
       annotations: cloneAnnotations(annotations),
       markers: cloneMarkers(markers),
       clips: cloneClips(clips),
@@ -346,7 +334,7 @@ function App() {
       trimStart,
       trimEnd,
     }),
-    [annotations, clips, markers, selectedClipId, selectedClipIds, selectedId, trimEnd, trimStart],
+    [annotations, clips, markers, selectedClipId, selectedClipIds, selectedId, selectedRange, trimEnd, trimStart],
   )
 
   const applySnapshot = useCallback(
@@ -354,23 +342,47 @@ function App() {
       setAnnotations(cloneAnnotations(snapshot.annotations))
       setMarkers(cloneMarkers(snapshot.markers))
       setClips(cloneClips(snapshot.clips))
+      setSelectedRange(snapshot.selectedRange)
+      setPlaying(false)
+      handleUserSeek(snapshot.playhead, "precise")
       setSelectedClipId(snapshot.selectedClipId)
       setSelectedClipIds([...snapshot.selectedClipIds])
       setSelectedId(snapshot.selectedId)
       setTrimStart(snapshot.trimStart)
       setTrimEnd(snapshot.trimEnd)
-      setSaved(false)
+      markUnsaved()
     },
-    [setTrimEnd, setTrimStart],
+    [markUnsaved, setTrimEnd, setTrimStart, handleUserSeek, setPlaying],
   )
 
+  const beginEdit = useCallback(() => {
+    if (!gestureRef.current) gestureRef.current = { snapshot: createSnapshot(), recorded: false }
+  }, [createSnapshot])
+  const endEdit = useCallback(() => { gestureRef.current = null }, [])
+  useEffect(() => {
+    const end = () => queueMicrotask(endEdit)
+    window.addEventListener("pointerup", end)
+    window.addEventListener("pointercancel", end)
+    window.addEventListener("blur", end)
+    return () => {
+      window.removeEventListener("pointerup", end)
+      window.removeEventListener("pointercancel", end)
+      window.removeEventListener("blur", end)
+    }
+  }, [endEdit])
+
   const pushHistory = useCallback(() => {
-    undoStackRef.current = [...undoStackRef.current.slice(-99), createSnapshot()]
+    const gesture = gestureRef.current
+    if (gesture?.recorded) return
+    undoStackRef.current = [...undoStackRef.current.slice(-99), gesture?.snapshot ?? createSnapshot()]
+    if (gesture) gesture.recorded = true
     redoStackRef.current = []
     setHistoryVersion((version) => version + 1)
   }, [createSnapshot])
 
   const selectClip = useCallback((clipId: string, additive = false) => {
+    setSelectedRange(null)
+    setSelectedId(null)
     setSelectedClipIds((prev) => {
       if (!additive) {
         setSelectedClipId(clipId)
@@ -378,8 +390,8 @@ function App() {
       }
       if (prev.includes(clipId)) {
         const next = prev.filter((id) => id !== clipId)
-        const selection = next.length > 0 ? next : [clipId]
-        setSelectedClipId(selection[selection.length - 1])
+        const selection = next
+        setSelectedClipId(selection[selection.length - 1] ?? null)
         return selection
       }
       setSelectedClipId(clipId)
@@ -388,33 +400,42 @@ function App() {
   }, [])
 
   const undo = useCallback(() => {
+    endEdit()
     const snapshot = undoStackRef.current.pop()
     if (!snapshot) return
 
     redoStackRef.current = [...redoStackRef.current.slice(-99), createSnapshot()]
     applySnapshot(snapshot)
     setHistoryVersion((version) => version + 1)
-  }, [applySnapshot, createSnapshot])
+  }, [applySnapshot, createSnapshot, endEdit])
 
   const redo = useCallback(() => {
+    endEdit()
     const snapshot = redoStackRef.current.pop()
     if (!snapshot) return
 
     undoStackRef.current = [...undoStackRef.current.slice(-99), createSnapshot()]
     applySnapshot(snapshot)
     setHistoryVersion((version) => version + 1)
-  }, [applySnapshot, createSnapshot])
+  }, [applySnapshot, createSnapshot, endEdit])
 
   const applyMedia = useCallback(
-    (media: OpenMediaResult, project?: ProjectFile) => {
-      proxyAttemptRef.current = null
-      setVideoCacheId(null)
+    (media: OpenMediaResult, project?: ProjectFile, cacheId?: string) => {
+      projectVersionRef.current += 1
+      setSeekTarget(0)
+      setSeekRevision(value => value + 1)
+      setSeekMode("precise")
+      setVideoCacheId(cacheId ?? null)
       setThumbnailCacheDir(null)
+      endEdit()
       loadMedia(media)
+      setMediaSession(session => session + 1)
       playbackClock.set(0)
       setMediaDetails({
         ...EMPTY_VIDEO_INFO,
         filename: media.fileName,
+        hasVideo: media.probe.hasVideo,
+        variableFps: media.probe.variableFps,
         duration: media.probe.duration,
         codec: normalizeInfoText(media.probe.codec),
         resolution: normalizeInfoText(media.probe.resolution),
@@ -431,7 +452,8 @@ function App() {
         startTime: 0,
         endTime: media.probe.duration,
       }
-      const restoredClips = project?.clips?.length ? numberClipLabels(project.clips) : [initialClip]
+      const restoredClips = project ? numberClipLabels(project.clips) : [initialClip]
+      setSelectedRange(null)
       const selectedClipIds = project?.selectedClipIds?.filter((id) =>
         restoredClips.some((clip) => clip.id === id),
       )
@@ -457,12 +479,9 @@ function App() {
       annotationClipboardRef.current = null
       setHistoryVersion((version) => version + 1)
       setSaved(true)
-      void mediaService
-        .createVideoCacheId(media.originalPath)
-        .then(setVideoCacheId)
-        .catch(() => setVideoCacheId(`video-${Date.now()}`))
+
     },
-    [loadMedia, mediaService, setPlaybackRate, setVolume],
+    [endEdit, loadMedia, setPlaybackRate, setVolume],
   )
 
   const addMarker = useCallback(() => {
@@ -477,82 +496,14 @@ function App() {
         color: "#3b82f6",
       },
     ])
-    setSaved(false)
-  }, [currentTime, hasMedia, pushHistory])
-
-  const handleOpenVideo = useCallback(async () => {
-    setLoading(true)
-    setError(null)
-
-    try {
-      if (playbackUrl) await mediaService.closeMedia(playbackUrl)
-      const media = await mediaService.openMedia()
-      if (media) {
-        applyMedia(media)
-        setProjectPath(null)
-      }
-    } catch (error) {
-      setError(toMediaServiceError(error))
-    } finally {
-      setLoading(false)
-    }
-  }, [applyMedia, mediaService, playbackUrl, setError, setLoading])
-
-  const handleOpenRecent = useCallback(async () => {
-    if (!recentMediaPath) return
-
-    setLoading(true)
-    setError(null)
-
-    try {
-      if (playbackUrl) await mediaService.closeMedia(playbackUrl)
-      const probe = await mediaService.probeMedia(recentMediaPath)
-      const media: OpenMediaResult = {
-        originalPath: recentMediaPath,
-        playbackUrl: await mediaService.preparePlayback(recentMediaPath),
-        fileName: fileNameFromPath(recentMediaPath),
-        probe,
-      }
-      applyMedia(media)
-      setProjectPath(null)
-    } catch (error) {
-      setError(toMediaServiceError(error))
-    } finally {
-      setLoading(false)
-    }
-  }, [applyMedia, fileNameFromPath, mediaService, playbackUrl, recentMediaPath, setError, setLoading])
-
-  const handleNewProject = useCallback(async () => {
-    if (playbackUrl) await mediaService.closeMedia(playbackUrl)
-    closeMedia()
-    playbackClock.set(0)
-    setMediaDetails(EMPTY_VIDEO_INFO)
-    setVideoCacheId(null)
-    setThumbnailCacheDir(null)
-    setAnnotations([])
-    setMarkers([])
-    setClips([])
-    setSelectedClipId(null)
-    setSelectedClipIds([])
-    setSelectedId(null)
-    setPxPerSecond(14)
-    setZoom(100)
-    setProjectPath(null)
-    setInspectorOpen(true)
-    setTimelineVisible(true)
-    undoStackRef.current = []
-    redoStackRef.current = []
-    annotationClipboardRef.current = null
-    setHistoryVersion((version) => version + 1)
-    setSaved(true)
-    setError(null)
-  }, [closeMedia, mediaService, playbackUrl, setError])
+    markUnsaved()
+  }, [currentTime, hasMedia, markUnsaved, pushHistory])
 
   const createProjectFile = useCallback(
     (): ProjectFile | null => {
       if (!originalPath) return null
       return {
-        version: 1,
+        version: 2,
         mediaPath: originalPath,
         annotations: cloneAnnotations(annotations),
         markers: cloneMarkers(markers),
@@ -585,9 +536,15 @@ function App() {
     async (path: string) => {
       const project = createProjectFile()
       if (!project) return
-      await writeProject(path, project)
+      const revision = editRevisionRef.current
+      const version = projectVersionRef.current
+      const writing = projectSaveQueueRef.current.catch(() => undefined).then(() => writeProject(path, project))
+      projectSaveQueueRef.current = writing
+      await writing
+      if (version !== projectVersionRef.current) return false
       setProjectPath(path)
-      setSaved(true)
+      if (revision === editRevisionRef.current) setSaved(true)
+      return revision === editRevisionRef.current
     },
     [createProjectFile],
   )
@@ -598,7 +555,7 @@ function App() {
     try {
       const fallbackName = `${(fileName ?? "project").replace(/\.[^/.]+$/, "")}.lumen.json`
       const path = await chooseProjectToSave(fallbackName)
-      if (path) await saveProjectToPath(path)
+      return path ? Boolean(await saveProjectToPath(path)) : false
     } catch (error) {
       setError(
         createAppError({
@@ -615,12 +572,11 @@ function App() {
   const handleSave = useCallback(async () => {
     if (!hasMedia) return
     if (!projectPath) {
-      await handleSaveAs()
-      return
+      return handleSaveAs()
     }
     setError(null)
     try {
-      await saveProjectToPath(projectPath)
+      return await saveProjectToPath(projectPath)
     } catch (error) {
       setError(
         createAppError({
@@ -634,40 +590,131 @@ function App() {
     }
   }, [handleSaveAs, hasMedia, projectPath, saveProjectToPath, setError])
 
-  const handleOpenProject = useCallback(async () => {
-    setLoading(true)
-    setError(null)
+  const allowProjectChange = useCallback(async () => {
+    const state = useMediaStore.getState()
+    if (state.exportStatus === "preparing" || state.exportStatus === "exporting") {
+      setError(createAppError({code: "EXPORT_ACTIVE", title: "Export in progress", message: "Finish or cancel the export before replacing this project.", recoverable: true}))
+      return false
+    }
+    if (saved || !state.originalPath) return true
+    const choice = await new Promise<"save" | "discard" | "cancel">((resolve) => {
+      discardResolverRef.current = resolve
+      setDiscardDialog(true)
+    })
+    return choice === "discard" || (choice === "save" && Boolean(await handleSave()))
+  }, [handleSave, saved, setError])
 
+  const openMediaTransaction = useCallback(async (choose: () => Promise<{media: OpenMediaResult; project?: ProjectFile; path?: string} | null>) => {
+    if (transitionRef.current) return
+    transitionRef.current = true
+    let prepared: OpenMediaResult | null = null
     try {
-      const path = await chooseProjectToOpen()
-      if (!path) return
-
-      if (playbackUrl) await mediaService.closeMedia(playbackUrl)
-      const project = await readProject(path)
-      const probe = await mediaService.probeMedia(project.mediaPath)
-      const media: OpenMediaResult = {
-        originalPath: project.mediaPath,
-        playbackUrl: await mediaService.preparePlayback(project.mediaPath),
-        fileName: fileNameFromPath(project.mediaPath),
-        probe,
-      }
-      applyMedia(media, project)
-      setProjectPath(path)
-      setSaved(true)
+      if (!await allowProjectChange()) return
+      setLoading(true)
+      setError(null)
+      const result = await choose()
+      if (!result) return
+      prepared = result.media
+      const cacheId = await mediaService.createVideoCacheId(prepared.originalPath)
+      const previousUrl = useMediaStore.getState().playbackUrl
+      await mediaService.cancelBackgroundMedia(true)
+      applyMedia(prepared, result.project, cacheId)
+      prepared = null
+      setProjectPath(result.path ?? null)
+      if (previousUrl) await mediaService.closeMedia(previousUrl).catch(() => undefined)
     } catch (error) {
-      setError(
-        createAppError({
-          code: "PROJECT_OPEN_FAILED",
-          title: "Project was not opened",
-          message: "The project file or its source video could not be loaded.",
-          technicalDetails: error instanceof Error ? error.message : String(error),
-          recoverable: true,
-        }),
-      )
+      setError(toMediaServiceError(error))
     } finally {
+      if (prepared) await mediaService.closeMedia(prepared.playbackUrl).catch(() => undefined)
+      transitionRef.current = false
       setLoading(false)
     }
-  }, [applyMedia, fileNameFromPath, mediaService, playbackUrl, setError, setLoading])
+  }, [allowProjectChange, applyMedia, mediaService, setError, setLoading])
+
+  const handleOpenVideo = useCallback(() => openMediaTransaction(async () => {
+    const media = await mediaService.openMedia()
+    return media ? {media} : null
+  }), [mediaService, openMediaTransaction])
+
+  const handleOpenRecent = useCallback(() => openMediaTransaction(async () => {
+    if (!recentMediaPath) return null
+    const probe = await mediaService.probeMedia(recentMediaPath)
+    return {media: {originalPath: recentMediaPath, fileName: fileNameFromPath(recentMediaPath), probe,
+      playbackUrl: await mediaService.preparePlayback(recentMediaPath)}}
+  }), [fileNameFromPath, mediaService, openMediaTransaction, recentMediaPath])
+
+  const handleOpenProject = useCallback(() => openMediaTransaction(async () => {
+    const path = await chooseProjectToOpen()
+    if (!path) return null
+    const project = await readProject(path)
+    const probe = await mediaService.probeMedia(project.mediaPath)
+    if (project.clips.some(clip => sourceStart(clip) + clip.endTime - clip.startTime > probe.duration + 0.05)) throw new Error("A project clip extends beyond the source duration.")
+    return {path, project, media: {originalPath: project.mediaPath, fileName: fileNameFromPath(project.mediaPath), probe,
+      playbackUrl: await mediaService.preparePlayback(project.mediaPath)}}
+  }), [fileNameFromPath, mediaService, openMediaTransaction])
+
+  const handleNewProject = useCallback(async () => {
+    if (transitionRef.current) return
+    transitionRef.current = true
+    try {
+      if (!await allowProjectChange()) return
+      const previousUrl = useMediaStore.getState().playbackUrl
+      await mediaService.cancelBackgroundMedia(true)
+      closeMedia()
+      projectVersionRef.current += 1
+      playbackClock.set(0)
+      endEdit()
+      setMediaDetails(EMPTY_VIDEO_INFO)
+      setVideoCacheId(null)
+      setThumbnailCacheDir(null)
+      setAnnotations([])
+      setMarkers([])
+      setClips([])
+      setSelectedRange(null)
+      setSelectedClipId(null)
+      setSelectedClipIds([])
+      setSelectedId(null)
+      setPxPerSecond(14)
+      setZoom(100)
+      setProjectPath(null)
+      setExportSettings(DEFAULT_EXPORT_SETTINGS)
+      setExportScope("timeline")
+      undoStackRef.current = []
+      redoStackRef.current = []
+      annotationClipboardRef.current = null
+      setHistoryVersion(version => version + 1)
+      setSaved(true)
+      setError(null)
+      if (previousUrl) await mediaService.closeMedia(previousUrl).catch(() => undefined)
+    } catch (error) { setError(toMediaServiceError(error)) }
+    finally { transitionRef.current = false }
+  }, [allowProjectChange, closeMedia, endEdit, mediaService, setError])
+
+  useEffect(() => {
+    const warn = (event: BeforeUnloadEvent) => {
+      if (!saved || useMediaStore.getState().exportStatus === "exporting") { event.preventDefault(); event.returnValue = "" }
+    }
+    window.addEventListener("beforeunload", warn)
+    return () => window.removeEventListener("beforeunload", warn)
+  }, [saved])
+  useEffect(() => {
+    if (!isTauri()) return
+    let disposed = false
+    let unlisten: (() => void) | undefined
+    void getCurrentWindow().onCloseRequested(async event => {
+      event.preventDefault()
+      if (transitionRef.current) return
+      transitionRef.current = true
+      try {
+        if (await allowProjectChange()) {
+          await mediaService.cancelBackgroundMedia(true)
+          await getCurrentWindow().destroy()
+        }
+      } catch (error) { setError(toMediaServiceError(error)) }
+      finally { transitionRef.current = false }
+    }).then(stop => { if (disposed) stop(); else unlisten = stop }).catch(() => undefined)
+    return () => { disposed = true; unlisten?.() }
+  }, [allowProjectChange, mediaService, setError])
 
   const fitZoomToScreen = useCallback(() => {
     setZoom(100)
@@ -675,32 +722,14 @@ function App() {
 
   const handleLoadedMetadata = useCallback(
     (metadata: { duration: number; resolution: string }) => {
-      setDuration(metadata.duration)
+      if (duration <= 0) setDuration(metadata.duration)
       setMediaDetails((details) => ({
         ...details,
-        duration: metadata.duration,
-        resolution: metadata.resolution,
+        duration: duration > 0 ? duration : metadata.duration,
+        resolution: details.resolution === "Unknown" ? metadata.resolution : details.resolution,
       }))
-      setClips((currentClips) => {
-        if (currentClips.length === 0) {
-          const clip = {
-            id: `clip-${Date.now()}`,
-            label: "Clip 1",
-            startTime: 0,
-            endTime: metadata.duration,
-          }
-          setSelectedClipId(clip.id)
-          setSelectedClipIds([clip.id])
-          return [clip]
-        }
-
-        return currentClips.map((clip, index) =>
-          index === 0 && clip.endTime <= 0 ? { ...clip, endTime: metadata.duration } : clip,
-        )
-      })
-
     },
-    [setDuration],
+    [duration, setDuration],
   )
 
   const selected = annotations.find((a) => a.id === selectedId) ?? null
@@ -710,9 +739,9 @@ function App() {
       if (!selectedId) return
       pushHistory()
       setAnnotations((prev) => prev.map((a) => (a.id === selectedId ? { ...a, ...patch } : a)))
-      setSaved(false)
+      markUnsaved()
     },
-    [pushHistory, selectedId],
+    [markUnsaved, pushHistory, selectedId],
   )
 
   const deleteSelected = useCallback(() => {
@@ -720,8 +749,8 @@ function App() {
     pushHistory()
     setAnnotations((prev) => prev.filter((a) => a.id !== selectedId))
     setSelectedId(null)
-    setSaved(false)
-  }, [pushHistory, selectedId])
+    markUnsaved()
+  }, [markUnsaved, pushHistory, selectedId])
 
   const copySelected = useCallback(() => {
     const selected = annotations.find((annotation) => annotation.id === selectedId)
@@ -752,13 +781,13 @@ function App() {
       label: `${source.label} Copy`,
       startTime,
       endTime,
-      x: Math.min(0.95, source.x + 0.03),
-      y: Math.min(0.95, source.y + 0.03),
+      x: Math.min(1 - source.width, source.x + 0.03),
+      y: Math.min(1 - source.height, source.y + 0.03),
     }
     setAnnotations((prev) => [...prev, pasted])
     setSelectedId(pasted.id)
-    setSaved(false)
-  }, [currentTime, effectiveDuration, hasMedia, pushHistory])
+    markUnsaved()
+  }, [currentTime, effectiveDuration, hasMedia, markUnsaved, pushHistory])
 
   const createAnnotation = useCallback(
     (annotation: Annotation) => {
@@ -766,73 +795,81 @@ function App() {
       pushHistory()
       setAnnotations((prev) => [...prev, annotation])
       setSelectedId(annotation.id)
-      setSaved(false)
+      markUnsaved()
     },
-    [hasMedia, pushHistory],
+    [hasMedia, markUnsaved, pushHistory],
   )
 
   const patchAnnotation = useCallback((id: string, patch: Partial<Annotation>) => {
+    pushHistory()
     setAnnotations((prev) => prev.map((annotation) => (annotation.id === id ? { ...annotation, ...patch } : annotation)))
-    setSaved(false)
-  }, [])
+    markUnsaved()
+  }, [markUnsaved, pushHistory])
 
-  const handleTrimChange = useCallback(
-    ([start, end]: [number, number]) => {
-      pushHistory()
-      setClips((prev) =>
-        prev.map((clip) =>
-          clip.id === selectedClipId ? { ...clip, startTime: start, endTime: end } : clip,
-        ),
-      )
-      setTrimStart(start)
-      setTrimEnd(end)
-      setSaved(false)
-    },
-    [pushHistory, selectedClipId, setTrimEnd, setTrimStart],
-  )
+  const commitTimeline = useCallback((content: TimelineContent, ids: string[] = [], cursor = playbackClock.getSnapshot()) => {
+    pushHistory()
+    setClips(numberClipLabels(content.clips))
+    setAnnotations(content.annotations)
+    setMarkers(content.markers)
+    const selection = ids.filter(id => content.clips.some(clip => clip.id === id))
+    setSelectedClipIds(selection)
+    setSelectedClipId(selection.at(-1) ?? null)
+    setSelectedRange(null)
+    setSelectedId(null)
+    setPlaying(false)
+    handleUserSeek(Math.min(cursor, editDuration(content.clips)), "precise")
+    markUnsaved()
+  }, [pushHistory, markUnsaved, handleUserSeek, setPlaying])
+
+  const editFrameDuration = 1 / videoInfo.fps
+  const handleTrimChange = useCallback((range: TimeRange) => {
+    if (!selectedClipId) return
+    const next = trimClip(clips, selectedClipId, range, duration, editFrameDuration)
+    if (next !== clips) commitTimeline({ clips: next, annotations, markers }, [selectedClipId])
+  }, [clips, annotations, markers, selectedClipId, duration, editFrameDuration, commitTimeline])
 
   const splitSelectedClip = useCallback(() => {
-    if (!selectedClip || currentTime <= selectedClip.startTime || currentTime >= selectedClip.endTime) return
+    const time = playbackClock.getSnapshot()
+    const next = splitClip(clips, time, editFrameDuration)
+    if (next === clips) return
+    const selected = clipAt(next, time)
+    commitTimeline({ clips: next, annotations, markers }, selected ? [selected.id] : [])
+  }, [clips, annotations, markers, editFrameDuration, commitTimeline])
 
-    pushHistory()
-    const nextClipId = `clip-${Date.now()}`
-    setClips((prev) =>
-      numberClipLabels(prev.flatMap((clip) => {
-        if (clip.id !== selectedClip.id) return [clip]
-        return [
-          {
-            ...clip,
-            endTime: currentTime,
-          },
-          {
-            id: nextClipId,
-            label: clip.label,
-            startTime: currentTime,
-            endTime: clip.endTime,
-          },
-        ]
-      })),
-    )
-    setSelectedClipId(nextClipId)
-    setSelectedClipIds([nextClipId])
-    setSaved(false)
-  }, [currentTime, pushHistory, selectedClip])
+  const deleteSelectedClip = useCallback((closeGap = rippleDelete) => {
+    const ranges: TimeRange[] = selectedRange ? [selectedRange]
+      : clips.filter(clip => selectedClipIds.includes(clip.id)).map(clip => [clip.startTime, clip.endTime])
+    if (!ranges.length) return
+    const content = { clips, annotations, markers }
+    const next = deleteRanges(content, ranges, closeGap)
+    if (next !== content) commitTimeline(next, [], Math.min(...ranges.map(range => range[0])))
+  }, [clips, annotations, markers, selectedClipIds, selectedRange, rippleDelete, commitTimeline])
 
-  const deleteSelectedClip = useCallback(() => {
-    const selectedIds = selectedClipIds.length > 0 ? selectedClipIds : selectedClipId ? [selectedClipId] : []
-    if (selectedIds.length === 0 || clips.length <= selectedIds.length) return
+  const moveSelectedClips = useCallback((ids: string[], target: number) => {
+    const content = { clips, annotations, markers }
+    const next = moveClips(content, ids, target)
+    if (next !== content) commitTimeline(next, ids, next.clips.find(clip => ids.includes(clip.id))?.startTime ?? target)
+  }, [clips, annotations, markers, commitTimeline])
 
-    pushHistory()
-    setClips((prev) => {
-      const next = numberClipLabels(prev.filter((clip) => !selectedIds.includes(clip.id)))
-      setSelectedClipId(next[0]?.id ?? null)
-      setSelectedClipIds(next[0] ? [next[0].id] : [])
-      return next
-    })
-    setSaved(false)
-  }, [clips.length, pushHistory, selectedClipId, selectedClipIds])
+  const selectRange = useCallback((range: TimeRange | null) => {
+    setSelectedRange(range)
+    setSelectedClipIds([])
+    setSelectedClipId(null)
+    setSelectedId(null)
+  }, [])
+
+  const moveSelectedRange = useCallback((range: TimeRange, target: number) => {
+    const content = { clips, annotations, markers }
+    const next = moveRanges(content, [range], target)
+    if (next === content) return
+    const start = target - Math.max(0, Math.min(target, range[1]) - range[0])
+    commitTimeline(next, [], start)
+    setSelectedRange([start, start + range[1] - range[0]])
+  }, [clips, annotations, markers, commitTimeline])
 
   const selectAllClips = useCallback(() => {
+    setSelectedRange(null)
+    setSelectedId(null)
     if (clips.length === 0) return
     const ids = clips.map((clip) => clip.id)
     setSelectedClipIds(ids)
@@ -841,7 +878,7 @@ function App() {
 
   const exportableClips = useCallback(() => {
     const selectedSet = new Set(selectedClipIds.length > 0 ? selectedClipIds : selectedClipId ? [selectedClipId] : [])
-    const sourceClips = exportScope === "all" ? clips : clips.filter((clip) => selectedSet.has(clip.id))
+    const sourceClips = exportScope !== "selected" ? clips : clips.filter((clip) => selectedSet.has(clip.id))
     return sourceClips
       .filter((clip) => clip.endTime > clip.startTime)
       .map((clip) => ({
@@ -849,6 +886,7 @@ function App() {
         label: clip.label,
         startTime: clip.startTime,
         endTime: clip.endTime,
+        sourceStart: sourceStart(clip),
       }))
   }, [clips, exportScope, selectedClipId, selectedClipIds])
 
@@ -861,11 +899,12 @@ function App() {
   }, [])
 
   const handleExport = useCallback(async () => {
+    if (transitionRef.current || ["preparing", "exporting"].includes(useMediaStore.getState().exportStatus)) return
     if (!originalPath) {
       setError({
         code: "NO_MEDIA",
-        title: "No video selected",
-        message: "Open a local video before exporting a trim range.",
+        title: "No media selected",
+        message: "Open a local video or audio file before exporting a trim range.",
         recoverable: true,
       })
       return
@@ -886,19 +925,23 @@ function App() {
     setExportProgress(0)
     setExportStatus("preparing")
 
+    let terminal = false
     try {
         const started = await mediaService.exportTrim(
           {
             inputPath: originalPath,
+            timeline: exportScope === "timeline",
             outputPath: "",
             clips: clipsToExport,
             annotations,
             settings: exportSettings,
           },
         (progress) => {
+          if (terminal) return
           if (progress.operationId) setExportOperationId(progress.operationId)
           setExportProgress(progress.progress)
 
+          if (progress.status === "completed" || progress.status === "failed" || progress.status === "cancelled") terminal = true
           if (progress.status === "completed") {
             setExportStatus("completed")
             setExportOperationId(null)
@@ -926,8 +969,10 @@ function App() {
         return
       }
 
-      setExportOperationId(started.operationId)
-      setExportStatus("exporting")
+      if (!terminal) {
+        setExportOperationId(started.operationId)
+        setExportStatus("exporting")
+      }
     } catch (error) {
       setExportOperationId(null)
       setExportStatus("failed")
@@ -938,6 +983,7 @@ function App() {
     mediaService,
     originalPath,
     exportSettings,
+    exportScope,
     exportableClips,
     setError,
     setExportProgress,
@@ -949,20 +995,19 @@ function App() {
 
     try {
       await mediaService.cancelOperation(exportOperationId)
-      setExportOperationId(null)
-      setExportStatus("cancelled")
+      // Wait for the terminal event before enabling another export.
     } catch (error) {
       setError(toMediaServiceError(error))
     }
-  }, [exportOperationId, mediaService, setError, setExportStatus])
+  }, [exportOperationId, mediaService, setError])
 
   const exportRunning = exportStatus === "preparing" || exportStatus === "exporting"
   const exportDisabled = !originalPath || exportRunning
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
+      if (discardDialog || useMediaStore.getState().isLoading) return
       const target = event.target as HTMLElement | null
-      const tagName = target?.tagName
 
       if (hasMedia && event.code === "Space" && !event.repeat && !isTextEditingTarget(target)) {
         event.preventDefault()
@@ -971,12 +1016,7 @@ function App() {
         return
       }
 
-      if (
-        target?.isContentEditable ||
-        tagName === "INPUT" ||
-        tagName === "TEXTAREA" ||
-        tagName === "SELECT"
-      ) {
+      if (isTextEditingTarget(target)) {
         return
       }
 
@@ -1064,18 +1104,21 @@ function App() {
         return
       }
 
-      if (event.key === "Delete") {
+      if (event.key === "Delete" || event.key === "Backspace") {
         if (selectedId) {
           event.preventDefault()
           deleteSelected()
           return
         }
-        if (selectedClipId) {
+        if (selectedClipId || selectedRange) {
           event.preventDefault()
-          deleteSelectedClip()
+          deleteSelectedClip(event.shiftKey ? !rippleDelete : rippleDelete)
           return
         }
       }
+
+      if (event.key === "Escape") { selectRange(null); return }
+      if (hasMedia && primary && key === "b") { event.preventDefault(); splitSelectedClip(); return }
 
       if (hasMedia && primary && (event.key === "ArrowLeft" || event.key === "ArrowRight")) {
         event.preventDefault()
@@ -1089,6 +1132,7 @@ function App() {
         const direction = event.key === "ArrowRight" ? 1 : -1
         const nextIndex = Math.max(0, Math.min(PLAYBACK_SPEEDS.length - 1, index + direction))
         setPlaybackRate(PLAYBACK_SPEEDS[nextIndex])
+        markUnsaved()
         return
       }
 
@@ -1148,6 +1192,8 @@ function App() {
     document.addEventListener("keydown", handleKeyDown, { capture: true })
     return () => document.removeEventListener("keydown", handleKeyDown, { capture: true })
   }, [
+    discardDialog,
+    markUnsaved,
     addMarker,
     copySelected,
     cutSelected,
@@ -1169,6 +1215,9 @@ function App() {
     selectAllClips,
     selectedId,
     selectedClipId,
+    selectedRange,
+    rippleDelete,
+    selectRange,
     setPlaybackRate,
     setPlaying,
     splitSelectedClip,
@@ -1192,6 +1241,26 @@ function App() {
 
   return (
     <div className="flex h-screen flex-col overflow-hidden bg-background text-foreground" title={appTitle}>
+      {discardDialog && (
+        <div className="fixed inset-0 z-[200] flex items-center justify-center bg-black/60" role="presentation">
+          <section role="alertdialog" aria-modal="true" aria-labelledby="unsaved-title" className="max-w-md rounded-xl border border-border bg-card p-6 shadow-xl" onKeyDown={event => {
+            if (event.key === "Escape") { event.preventDefault(); answerDiscard("cancel") }
+            if (event.key === "Tab") {
+              const buttons = [...event.currentTarget.querySelectorAll<HTMLButtonElement>("button")]
+              const next = (buttons.indexOf(document.activeElement as HTMLButtonElement) + (event.shiftKey ? -1 : 1) + buttons.length) % buttons.length
+              event.preventDefault(); buttons[next]?.focus()
+            }
+          }}>
+            <h2 id="unsaved-title" className="text-lg font-semibold">Save your changes?</h2>
+            <p className="my-4 text-sm text-muted-foreground">This project has unsaved changes.</p>
+            <div className="flex gap-3">
+              <button className="rounded bg-secondary px-3 py-2" onClick={() => answerDiscard("cancel")} autoFocus>Cancel</button>
+              <button className="rounded bg-secondary px-3 py-2" onClick={() => answerDiscard("discard")}>Discard changes</button>
+              <button className="rounded bg-primary px-3 py-2 text-primary-foreground" onClick={() => answerDiscard("save")}>Save changes</button>
+            </div>
+          </section>
+        </div>
+      )}
       <MenuBar
         hasMedia={hasMedia}
         hasRecent={Boolean(recentMediaPath)}
@@ -1201,7 +1270,7 @@ function App() {
         canCut={canEditSelected}
         canCopy={canEditSelected}
         canPaste={canPasteAnnotation}
-        canDelete={canEditSelected}
+        canDelete={canEditSelected || selectedClipIds.length > 0 || selectedRange !== null}
         canSelectAll={clips.length > 0}
         timelineVisible={timelineVisible}
         inspectorOpen={inspectorOpen}
@@ -1217,7 +1286,7 @@ function App() {
         onCut={cutSelected}
         onCopy={copySelected}
         onPaste={pasteAnnotation}
-        onDelete={deleteSelected}
+        onDelete={() => selectedId ? deleteSelected() : deleteSelectedClip()}
         onSelectAll={selectAllClips}
         onZoomIn={() => setZoom((value) => Math.min(400, value + 25))}
         onZoomOut={() => setZoom((value) => Math.max(25, value - 25))}
@@ -1266,6 +1335,7 @@ function App() {
 
       <div className="flex min-h-0 flex-1">
         <ToolSidebar
+          annotationsDisabled={!hasMedia || videoInfo.hasVideo === false}
           active={activeTool}
           onSelect={setActiveTool}
           collapsed={sidebarCollapsed}
@@ -1275,10 +1345,21 @@ function App() {
         <div className="flex min-w-0 flex-1 flex-col">
           <div className="flex min-h-0 flex-1">
             <Preview
+              clips={clips}
+              playbackCopy={playbackCopy.state}
+              playbackCopyProgress={performanceConfig?.playbackProxy?.videoId === videoCacheId ? performanceConfig.playbackProxy.progress : 0}
+              onPreparePlayback={() => { void playbackCopy.start() }}
+              onPlaybackError={playbackCopy.recover}
+              onCancelPlaybackCopy={playbackCopy.cancel}
+              onTogglePlaybackCopy={() => { void playbackCopy.toggle() }}
               videoInfo={videoInfo}
+              frameSourcePath={playbackCopy.state.active ? playbackCopy.state.path ?? originalPath : originalPath}
+              mediaSession={mediaSession}
+              seekFrameTime={seekFrameTime}
               playbackUrl={playbackUrl}
               currentTime={currentTime}
               seekRevision={seekRevision}
+              seekTarget={seekTarget}
               seekMode={seekMode}
               duration={effectiveDuration}
               isPlaying={isPlaying}
@@ -1290,14 +1371,15 @@ function App() {
               zoom={zoom}
               onZoomChange={setZoom}
               playbackSpeed={String(playbackRate)}
-              onPlaybackSpeedChange={(value) => setPlaybackRate(Number.parseFloat(value))}
+              onPlaybackSpeedChange={(value) => { setPlaybackRate(Number.parseFloat(value)); markUnsaved() }}
               volume={volume * 100}
-              onVolumeChange={(value) => setVolume(value / 100)}
+              onVolumeChange={(value) => { setVolume(value / 100); markUnsaved() }}
               activeTool={activeTool}
               annotations={annotations}
               selectedId={selectedId}
               onSelectAnnotation={setSelectedId}
               onCreateAnnotation={createAnnotation}
+              onEditStart={beginEdit}
               onUpdateAnnotation={patchAnnotation}
               onOpenVideo={handleOpenVideo}
               hasMedia={hasMedia}
@@ -1308,6 +1390,8 @@ function App() {
               <Inspector
                 videoInfo={videoInfo}
                 selected={selected}
+                onEditStart={beginEdit}
+                onEditEnd={endEdit}
                 onChange={updateSelected}
                 onDelete={deleteSelected}
                 onClose={() => setInspectorOpen(false)}
@@ -1325,8 +1409,15 @@ function App() {
           </div>
 
           {hasMedia && timelineVisible && (
-            <div className="h-64 shrink-0 border-t border-border">
+            <div className="h-72 shrink-0 border-t border-border">
               <Timeline
+                sourceDuration={duration}
+                selectedRange={selectedRange}
+                onSelectRange={selectRange}
+                onMoveClips={moveSelectedClips}
+                onMoveRange={moveSelectedRange}
+                rippleDelete={rippleDelete}
+                onRippleDeleteChange={setRippleDelete}
                 duration={effectiveDuration}
                 playbackUrl={playbackUrl}
                 originalPath={originalPath}
@@ -1347,6 +1438,7 @@ function App() {
                 annotations={annotations}
                 selectedId={selectedId}
                 onSelectAnnotation={setSelectedId}
+                onEditStart={beginEdit}
                 onUpdateAnnotation={patchAnnotation}
                 trim={trim}
                 onTrimChange={handleTrimChange}
@@ -1362,6 +1454,8 @@ function App() {
         hasMedia={hasMedia}
         currentFrame={currentFrame}
         fps={videoInfo.fps}
+        variableFps={videoInfo.variableFps}
+        currentTime={currentTime}
         isPlaying={isPlaying}
         saved={saved}
         exportStatus={statusLabel}
@@ -1375,8 +1469,8 @@ function App() {
         settings={exportSettings}
         scope={exportScope}
         exportRunning={exportRunning}
-        onSettingsChange={setExportSettings}
-        onScopeChange={setExportScope}
+        onSettingsChange={(settings) => { setExportSettings(settings); markUnsaved() }}
+        onScopeChange={(scope) => { setExportScope(scope); markUnsaved() }}
         onClose={() => setExportSettingsOpen(false)}
         onExport={handleExport}
       />

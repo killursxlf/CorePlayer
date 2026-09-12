@@ -18,6 +18,7 @@ jobs:
     name: Build ${{ matrix.platform }}
     runs-on: ${{ matrix.platform }}
     timeout-minutes: 60
+
     strategy:
       fail-fast: false
       matrix:
@@ -25,12 +26,15 @@ jobs:
           - platform: macos-latest
             args: --target aarch64-apple-darwin
             rust-targets: aarch64-apple-darwin,x86_64-apple-darwin
+
           - platform: macos-latest
             args: --target x86_64-apple-darwin
             rust-targets: aarch64-apple-darwin,x86_64-apple-darwin
+
           - platform: ubuntu-22.04
             args: ""
             rust-targets: ""
+
           - platform: windows-latest
             args: "--bundles nsis"
             rust-targets: ""
@@ -58,7 +62,12 @@ jobs:
         if: matrix.platform == 'ubuntu-22.04'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xdg-utils
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            xdg-utils
 
       - name: Install frontend dependencies
         run: bun install --frozen-lockfile
@@ -75,7 +84,11 @@ jobs:
 
       - name: Prepare bundled FFmpeg
         if: matrix.platform == 'windows-latest'
-        run: bun run prepare:ffmpeg
+        shell: pwsh
+        run: |
+          $PSVersionTable.PSVersion
+          Import-Module Microsoft.PowerShell.Utility
+          ./scripts/prepare-ffmpeg.ps1
 
       - name: Test Rust backend
         run: cargo test --manifest-path src-tauri/Cargo.toml --locked
@@ -91,4 +104,3 @@ jobs:
           releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}
-          # trigger workflow registration

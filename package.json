@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "prepare:ffmpeg": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/prepare-ffmpeg.ps1",
+    "prepare:ffmpeg": "pwsh -NoProfile -File scripts/prepare-ffmpeg.ps1",
     "build:installer": "bunx tauri build --bundles nsis",
     "dev": "vite",
     "build": "tsc -b && vite build",

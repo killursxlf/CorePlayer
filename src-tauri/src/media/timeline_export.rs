@@ -1,9 +1,26 @@
 use super::*;
 
+fn continuous_ranges(clips: &[ExportClip]) -> Vec<ExportClip> {
+    let mut ranges: Vec<ExportClip> = Vec::new();
+    for clip in clips {
+        if let Some(last) = ranges.last_mut() {
+            let source_end = last.source_start.unwrap_or(last.start_time) + last.end_time - last.start_time;
+            if last.end_time > last.start_time && clip.end_time > clip.start_time && (last.end_time - clip.start_time).abs() < 0.000001
+                && (source_end - clip.source_start.unwrap_or(clip.start_time)).abs() < 0.000001 {
+                last.end_time = clip.end_time;
+                continue;
+            }
+        }
+        ranges.push(clip.clone());
+    }
+    ranges
+}
+
 /// Seek each source range, concatenate decoded frames, then encode only once.
 pub(super) fn build(ffmpeg: &Path, input: &str, output: &str, clips: &[ExportClip], settings: &ExportSettings, annotations: &[ExportAnnotation], threads: usize) -> Result<Command, MediaError> {
     let fail = |message: &str| MediaError::Io(message.into());
     if clips.is_empty() { return Err(fail("The timeline is empty.")); }
+    let clips = continuous_ranges(clips);
     // ponytail: bounded input decoders; use staged batches when projects exceed 256 clips.
     if clips.len() > 256 { return Err(fail("Single-file export supports up to 256 clips. Export a smaller selection as separate files.")); }
     let probe = crate::media::ffprobe::probe_media(input)?;
@@ -36,6 +53,7 @@ pub(super) fn build(ffmpeg: &Path, input: &str, output: &str, clips: &[ExportCli
     let overlay = write_clip_ass_overlay(&whole, annotations, &Path::new(output).with_extension("ass"))?;
     let mut command = media_command(ffmpeg);
     command.args(["-hide_banner", "-nostdin", "-y", "-filter_complex_threads", "1"]);
+    let decode_threads = (threads / clips.len()).clamp(1, 4).to_string();
     let mut segments = Vec::new();
     let mut cursor = 0.0;
     for (input_index, clip) in clips.iter().enumerate() {
@@ -46,7 +64,7 @@ pub(super) fn build(ffmpeg: &Path, input: &str, output: &str, clips: &[ExportCli
         }
         if clip.start_time > cursor + 0.000001 { segments.push((None, cursor, clip.start_time)); }
         segments.push((Some(input_index), clip.start_time, clip.end_time));
-        command.args(["-threads", "1", "-ss", &format!("{source:.6}"), "-t", &format!("{span:.6}"), "-i", input]);
+        command.args(["-threads", &decode_threads, "-ss", &format!("{source:.6}"), "-t", &format!("{span:.6}"), "-i", input]);
         cursor = clip.end_time;
     }
     let mut graph = Vec::new();
@@ -55,12 +73,8 @@ pub(super) fn build(ffmpeg: &Path, input: &str, output: &str, clips: &[ExportCli
         let span = end - start;
         if has_video {
             let beginning = if let Some(input) = source { format!("[{input}:V:0]setpts=PTS-STARTPTS,tpad=stop_mode=clone:stop_duration={span:.6},trim=duration={span:.6}") }
-                else { format!("color=c=black:s={width}x{height}:r={fps}:d={span:.6}") };
-            let active: Vec<_> = annotations.iter().filter(|a| a.start_time < *end && a.end_time > *start).cloned().collect();
-            let effects = annotation_filters(&whole, &active, overlay.as_deref()).join(",")
-                .replace("[base", &format!("[s{index}base")).replace("[region", &format!("[s{index}region")).replace("[blur", &format!("[s{index}blur"));
-            let effects = if effects.is_empty() { String::new() } else { format!(",setpts=PTS+{start:.6}/TB,{effects},setpts=PTS-{start:.6}/TB") };
-            graph.push(format!("{beginning}{effects},scale={width}:{height}:force_original_aspect_ratio=decrease:force_divisible_by=2,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p,settb=AVTB[v{index}]"));
+                else { format!("color=c=black:s={}x{}:r={fps}:d={span:.6}", (sw / 2 * 2).max(2), (sh / 2 * 2).max(2)) };
+            graph.push(format!("{beginning},scale={}:{}:flags=bilinear,setsar=1,format=yuv420p,settb=AVTB[v{index}]", (sw / 2 * 2).max(2), (sh / 2 * 2).max(2)));
             concat_inputs.push_str(&format!("[v{index}]"));
         }
         for (audio, layout) in layouts.iter().enumerate() {
@@ -77,7 +91,10 @@ pub(super) fn build(ffmpeg: &Path, input: &str, output: &str, clips: &[ExportCli
     graph.push(format!("{concat_inputs}concat=n={}:v={}:a={audio_count}{video_label}{audio_labels}", segments.len(), usize::from(has_video)));
     if has_video {
         let rate = settings.fps.map(|fps| format!("fps={fps},")).unwrap_or_default();
-        graph.push(format!("[joinedv]{rate}null[timelinev]"));
+        // Effects use edited time and are rendered once, sharing one libass context across cuts.
+        let effects = annotation_filters(&whole, annotations, overlay.as_deref()).join(",");
+        let effects = if effects.is_empty() { effects } else { format!("{effects},") };
+        graph.push(format!("[joinedv]{effects}scale={width}:{height}:force_original_aspect_ratio=decrease:force_divisible_by=2,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p,{rate}null[timelinev]"));
         command.args(["-map", "[timelinev]"]);
     }
     if probe.has_audio == Some(true) {

@@ -68,6 +68,38 @@ fn invalid_colors_and_effect_overlays_are_safe() {
         .contains("1a&H80&"));
 }
 
+#[test]
+#[ignore = "Requires FFmpeg; measures the montage pipeline with many cuts and drawings"]
+fn montage_throughput() {
+    let root = std::env::temp_dir().join(format!("lumen-montage-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&root).unwrap();
+    let ffmpeg = ffmpeg_path().unwrap();
+    let input = root.join("input.mp4");
+    let mut generate = media_command(&ffmpeg);
+    generate.args(["-v", "error", "-f", "lavfi", "-i", "testsrc2=s=1280x720:r=30:d=12",
+        "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=12", "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac"]).arg(&input);
+    run(generate);
+    let clips: Vec<_> = (0..24).map(|i| ExportClip { id: i.to_string(), label: i.to_string(),
+        start_time: i as f64 * 0.5, end_time: (i+1) as f64 * 0.5, source_start: Some(i as f64 * 0.5) }).collect();
+    let annotations: Vec<_> = (0..40).map(|i| { let mut a = effect(ExportAnnotationType::Rectangle);
+        a.id = i.to_string(); a.x = (i % 10) as f64 * 0.06; a.y = (i / 10) as f64 * 0.1;
+        a.width = 0.15; a.height = 0.15; a.end_time = 12.0; a }).collect();
+    for (name, cuts) in [("continuous", clips.clone()), ("reordered", clips.iter().enumerate().map(|(i,c)| {
+        let mut c = c.clone(); c.source_start = Some((23-i) as f64 * 0.5); c
+    }).collect())] {
+        let output = root.join(format!("{name}.mp4"));
+        let start = Instant::now();
+        let command = timeline_export::build(&ffmpeg, &input.to_string_lossy(), &output.to_string_lossy(), &cuts, &settings(), &annotations, 4).unwrap();
+        let inputs = command.get_args().filter(|a| *a == "-i").count();
+        run(command);
+        println!("MONTAGE {name}: {:.3}s, {inputs} decoders, 12s 720p, 24 cuts, 40 drawings", start.elapsed().as_secs_f64());
+        let probe = crate::media::ffprobe::probe_media(&output.to_string_lossy()).unwrap();
+        assert!((probe.duration - 12.0).abs() < 0.06);
+        assert_eq!(probe.has_audio, Some(true));
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
 /// Run explicitly with installed FFmpeg/ffprobe (or FFMPEG_PATH/FFPROBE_PATH).
 #[test]
 #[ignore = "Requires FFmpeg with libx264/libvpx/libass and ffprobe"]

@@ -78,6 +78,8 @@ export function ToolSidebar({ active, onSelect, collapsed, onToggleCollapse, ann
           const button = (
             <button
               type="button"
+              aria-label={tool.label}
+              aria-pressed={isActive}
               disabled={annotationsDisabled && tool.id !== "select"}
               onClick={() => onSelect(tool.id)}
               className={cn(

@@ -6,13 +6,6 @@ import type { ThumbnailCache } from "./thumbnail-cache"
 import type { TimelineScale } from "./timeline-scale"
 import type { VisibleRange } from "./visible-range"
 import { RULER_HEIGHT, VIDEO_TRACK_TOP, VIDEO_TRACK_HEIGHT, audioTrackTop, subtitleTrackTop } from "./timeline-layout"
-import {
-  ANNOTATION_LANE_HEIGHT,
-  ANNOTATION_TRACK_HEIGHT,
-  ANNOTATION_TRACK_TOP,
-  annotationLaneTop,
-  assignAnnotationLanes,
-} from "./annotation-lanes"
 
 export type TimelineRenderModel = {
   duration: number
@@ -70,7 +63,6 @@ export function renderTimelineCanvas(canvas: HTMLCanvasElement, model: TimelineR
 
   drawRuler(context, model, cssWidth)
   drawVideoTrack(context, model, cssWidth)
-  drawAnnotations(context, model)
   if (model.hasAudio) drawAudio(context, model, cssWidth)
   if (model.hasSubtitles) drawSubtitles(context, cssWidth, subtitleTrackTop(model.annotations.length > 0, model.hasAudio))
 }
@@ -231,27 +223,6 @@ function drawLoadingSlot(
   if (state === "queued" || state === "loading") {
     context.fillStyle = "rgba(255,255,255,0.12)"
     context.fillRect(x + 4, y + height - 5, Math.max(4, width - 8), 1)
-  }
-}
-
-function drawAnnotations(context: CanvasRenderingContext2D, model: TimelineRenderModel) {
-  if (model.annotations.length === 0) return
-  drawTrackBackground(context, ANNOTATION_TRACK_TOP, ANNOTATION_TRACK_HEIGHT, model.range.viewportWidth)
-  const lanes = assignAnnotationLanes(model.annotations)
-
-  for (const annotation of model.annotations) {
-    const x = screenX(model, annotation.startTime)
-    const width = Math.max(28, (annotation.endTime - annotation.startTime) * model.scale.pixelsPerSecond)
-    const lane = lanes.get(annotation.id) ?? 0
-    const y = annotationLaneTop(lane)
-    context.fillStyle = annotation.id === model.selectedId ? "rgba(240,171,252,0.32)" : "rgba(240,171,252,0.16)"
-    context.strokeStyle = colors.annotation
-    roundedRect(context, x, y, width, ANNOTATION_LANE_HEIGHT, 4)
-    context.fill()
-    context.stroke()
-    context.fillStyle = colors.text
-    context.font = "9px ui-sans-serif, system-ui"
-    if (width > 34) context.fillText(annotation.label, x + 6, y + 1)
   }
 }
 

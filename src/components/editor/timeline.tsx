@@ -16,9 +16,11 @@ import {
   ZoomIn,
   ZoomOut,
   Maximize2,
+  EyeOff,
+  ArrowUpRight, Square, Circle, Highlighter, Brush, Crop, Ruler, Droplets,
 } from "lucide-react"
 import type { Annotation, TimelineClip, TimelineMarker, VideoInfo } from "@/lib/editor-types"
-import { formatClock } from "@/lib/editor-types"
+import { ANNOTATION_NAMES, formatClock, formatTimecode } from "@/lib/editor-types"
 import { cn } from "@/lib/utils"
 import { sourceStart, snapToEdges, timelineGaps, visibleSourceRanges, type TimeRange } from "@/lib/timeline-edit"
 import type { AudioWaveformResult } from "@/types/media"
@@ -37,7 +39,7 @@ import {
   createTimelineScale,
   zoomAroundCursor,
 } from "./timeline/timeline-scale"
-import { calculateVisibleRange, type VisibleRange } from "./timeline/visible-range"
+import { calculateVisibleRange } from "./timeline/visible-range"
 import { RULER_HEIGHT, VIDEO_ROW_HEIGHT, VIDEO_TRACK_TOP, VIDEO_TRACK_HEIGHT, ANNOTATION_ROW_HEIGHT, AUDIO_ROW_HEIGHT, SUBTITLE_ROW_HEIGHT } from "./timeline/timeline-layout"
 import {
   ANNOTATION_LANE_HEIGHT,
@@ -94,16 +96,8 @@ interface TimelineProps {
   onCacheDirChange?: (cacheDir: string | null) => void
 }
 
-function nearestTrackAnnotation(
-  annotations: Annotation[],
-  range: VisibleRange,
-  pxPerSecond: number,
-  clientX: number,
-  rectLeft: number,
-) {
-  const time = (range.scrollLeft + clientX - rectLeft) / pxPerSecond
-  return annotations.find((annotation) => time >= annotation.startTime && time <= annotation.endTime) ?? null
-}
+const annotationIcons = { arrow: ArrowUpRight, rectangle: Square, circle: Circle, text: Type,
+  blur: Droplets, highlight: Highlighter, pen: PenLine, brush: Brush, crop: Crop, measure: Ruler }
 
 export function Timeline({
   sourceDuration, selectedRange, onSelectRange, onMoveClips, onMoveRange, rippleDelete, onRippleDeleteChange,
@@ -135,6 +129,8 @@ export function Timeline({
   onCacheDirChange,
 }: TimelineProps) {
   const scrollRef = useRef<HTMLDivElement>(null)
+  const annotationScrollRef = useRef<HTMLDivElement>(null)
+  const [annotationScrollTop, setAnnotationScrollTop] = useState(0)
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const playheadCanvasRef = useRef<HTMLCanvasElement>(null)
   const playheadHandleRef = useRef<HTMLDivElement>(null)
@@ -230,13 +226,24 @@ export function Timeline({
   const tracks = useMemo(
     () => [
       { id: "video", label: videoInfo.hasVideo === false ? "Audio clips" : "Video", icon: videoInfo.hasVideo === false ? Music : Video, height: VIDEO_ROW_HEIGHT },
-      ...(hasAnnotations ? [{ id: "annotations", label: "Annotations", icon: PenLine, height: ANNOTATION_ROW_HEIGHT }] : []),
+      ...(hasAnnotations ? [{ id: "annotations", label: "Объекты", icon: PenLine, height: ANNOTATION_ROW_HEIGHT }] : []),
       ...(hasAudio ? [{ id: "audio", label: "Audio", icon: Music, height: AUDIO_ROW_HEIGHT }] : []),
       ...(hasSubtitles ? [{ id: "subtitles", label: "Subtitles", icon: Type, height: SUBTITLE_ROW_HEIGHT }] : []),
     ],
     [hasAnnotations, hasAudio, hasSubtitles, videoInfo.hasVideo],
   )
-  const annotationLanes = useMemo(() => assignAnnotationLanes(annotations), [annotations])
+  const annotationLanes = useMemo(() => assignAnnotationLanes(annotations, scale.pixelsPerSecond), [annotations, scale.pixelsPerSecond])
+  const annotationContentHeight = Math.max(ANNOTATION_TRACK_HEIGHT, annotationLaneTop([...annotationLanes.values()].reduce((count, lane) => Math.max(count, lane + 1), 0)))
+  const annotationViewportTop = Math.min(annotationScrollTop, annotationContentHeight - ANNOTATION_TRACK_HEIGHT)
+  // Reveal selections made in the preview or object picker, including lanes outside the viewport.
+  useEffect(() => {
+    const lane = selectedId ? annotationLanes.get(selectedId) : undefined
+    const scroller = annotationScrollRef.current
+    if (lane === undefined || !scroller) return
+    const top = annotationLaneTop(lane)
+    if (top < scroller.scrollTop) scroller.scrollTop = top
+    else if (top + ANNOTATION_LANE_HEIGHT > scroller.scrollTop + scroller.clientHeight) scroller.scrollTop = top + ANNOTATION_LANE_HEIGHT - scroller.clientHeight
+  }, [selectedId, annotationLanes])
   const timelineHeight = RULER_HEIGHT + tracks.reduce((height, track) => height + track.height, 0) + 16
   const timelineProgress = useMemo(() => {
     if (!videoId) return { total: 0, ready: 0, pending: 0 }
@@ -830,18 +837,6 @@ export function Timeline({
         }
       }
 
-      const annotation = nearestTrackAnnotation(
-        annotations,
-        range,
-        scale.pixelsPerSecond,
-        event.clientX,
-        rect.left,
-      )
-      if (annotation && localY >= ANNOTATION_TRACK_TOP && localY <= ANNOTATION_TRACK_TOP + ANNOTATION_TRACK_HEIGHT) {
-        onSelectAnnotation(annotation.id)
-        return
-      }
-
       movePlayheadFromPointer(event.clientX, event.altKey)
       let active = true
       let lastScrubTime = time
@@ -869,13 +864,9 @@ export function Timeline({
       window.addEventListener("blur", cleanup)
     },
     [
-      annotations,
       clips,
       onSeek,
-      onSelectAnnotation,
       onSelectClip,
-      range,
-      scale,
       movePlayheadFromPointer,
       snapEnabled,
       timeFromClientX,
@@ -886,6 +877,7 @@ export function Timeline({
   const handleWheel = useCallback(
     (event: WheelEvent) => {
       if (duration <= 0) return
+      if (!event.ctrlKey && !event.metaKey && (event.target as HTMLElement).closest("[data-annotation-scroll]")) return
       const el = scrollRef.current
       if (!el) return
       event.preventDefault()
@@ -979,19 +971,29 @@ export function Timeline({
   }, [onTrimChange, scale.frameDuration, trim])
 
   const dragAnnotationTime = useCallback(
-    (annotation: Annotation, mode: "move" | "start" | "end") => (event: React.PointerEvent) => {
+    (annotation: Annotation, mode: "move" | "start" | "end") => (event: React.PointerEvent<HTMLButtonElement>) => {
+      if (event.button !== 0) return
       event.preventDefault()
       event.stopPropagation()
-      onEditStart()
+      event.currentTarget.focus()
       onSelectAnnotation(annotation.id)
+      if (annotation.type === "crop") return
+      gestureCleanup.current?.()
 
       const startTime = annotation.startTime
       const endTime = annotation.endTime
       const span = Math.max(scale.frameDuration, endTime - startTime)
-      const pointerStart = timeFromClientX(event.clientX, snapEnabled)
+      const pointerStart = timeFromClientX(event.clientX, false)
+      const initialX = event.clientX
+      let moved = false
 
       const move = (moveEvent: PointerEvent) => {
-        const pointerTime = timeFromClientX(moveEvent.clientX, snapEnabled)
+        if (!moved) {
+          if (Math.abs(moveEvent.clientX - initialX) < 3) return
+          moved = true
+          onEditStart()
+        }
+        const pointerTime = timeFromClientX(moveEvent.clientX, snapEnabled && !moveEvent.altKey)
         const delta = pointerTime - pointerStart
         if (mode === "move") {
           const nextStart = clamp(startTime + delta, 0, Math.max(0, duration - span))
@@ -1018,7 +1020,18 @@ export function Timeline({
         window.removeEventListener("pointerup", up)
         window.removeEventListener("pointercancel", up)
         window.removeEventListener("blur", up)
+        window.removeEventListener("keydown", cancel)
+        gestureCleanup.current = null
+        setSnapGuide(null)
       }
+      const cancel = (event: KeyboardEvent) => {
+        if (event.key !== "Escape") return
+        event.preventDefault(); event.stopPropagation()
+        if (moved) onUpdateAnnotation(annotation.id, { startTime, endTime })
+        up()
+      }
+      gestureCleanup.current = up
+      window.addEventListener("keydown", cancel)
       window.addEventListener("pointermove", move)
       window.addEventListener("pointerup", up)
       window.addEventListener("pointercancel", up)
@@ -1034,6 +1047,18 @@ export function Timeline({
           Timeline
         </div>
         <div className="mx-1 h-4 w-px bg-border" />
+        {hasAnnotations && <select aria-label="Объект на таймлайне" value={selectedId ?? ""}
+          className="max-w-56 rounded-md border border-border bg-card px-2 py-1 text-xs"
+          onChange={event => {
+            const annotation = annotations.find(a => a.id === event.target.value)
+            if (!annotation) return
+            onSelectAnnotation(annotation.id)
+            onSeek(annotation.startTime, "precise")
+            if (scrollRef.current) scrollRef.current.scrollLeft = Math.max(0, scale.timeToX(annotation.startTime) - 40)
+          }}>
+          <option value="">Объекты ({annotations.length}) — выбрать…</option>
+          {annotations.map(a => <option key={a.id} value={a.id}>{a.visible ? "" : "◌ "}{ANNOTATION_NAMES[a.type]} · {a.label} · {formatClock(a.startTime)}</option>)}
+        </select>}
         <button type="button" aria-pressed={rangeTool} onClick={() => setRangeTool(value => !value)}
           title="Выделить произвольный участок перетаскиванием. Также Shift + перетаскивание."
           className={cn("rounded-md px-2 py-1 text-xs", rangeTool ? "bg-primary/20 text-primary" : "text-muted-foreground")}>
@@ -1204,8 +1229,10 @@ export function Timeline({
                 className="flex items-center gap-2 border-b border-border/50 px-3 text-xs text-muted-foreground"
                 style={{height: track.height}}
               >
-                <Icon className={cn("size-3.5 shrink-0", track.id === "audio" ? "text-emerald-300/80" : track.id === "annotations" ? "text-fuchsia-300/80" : "text-sky-300/80")} />
-                <span className="truncate">{track.label}</span>
+                {track.id !== "annotations" && <Icon className={cn("size-3.5 shrink-0", track.id === "audio" ? "text-emerald-300/80" : "text-sky-300/80")} />}
+                <div className="min-w-0"><span className="block truncate">{track.label}</span>
+                  {track.id === "annotations" && <span className="mt-1 block text-[10px] leading-relaxed text-muted-foreground/70">{annotations.length} объектов<br />Колесо — строки<br />Края — время</span>}
+                </div>
               </div>
             )
           })}
@@ -1238,7 +1265,7 @@ export function Timeline({
               />
               <canvas
                 ref={playheadCanvasRef}
-                className="pointer-events-none absolute inset-0 z-10 block h-full"
+                className="pointer-events-none absolute inset-0 z-30 block h-full"
                 style={{ width: viewport.width, height: "100%" }}
               />
               <div
@@ -1302,14 +1329,25 @@ export function Timeline({
               style={{ left: scale.timeToX(dragPreview.time), width: dragPreview.span * scale.pixelsPerSecond, top: VIDEO_TRACK_TOP, height: VIDEO_TRACK_HEIGHT }}>
               <span className="rounded bg-slate-900 px-1 text-xs text-white">Вставить {dragPreview.time.toFixed(2)} с</span>
             </div>}
-            {annotations.filter(annotation => annotation.endTime >= range.visibleStart && annotation.startTime <= range.visibleEnd).map((annotation) => {
-              const left = scale.timeToX(annotation.startTime)
+            {hasAnnotations && <div ref={annotationScrollRef} data-annotation-scroll
+              aria-label="Дорожки объектов" className="absolute z-20 overflow-x-hidden overflow-y-auto overscroll-contain rounded border border-border/50"
+              style={{ left: viewport.scrollLeft, top: ANNOTATION_TRACK_TOP, width: viewport.width, height: ANNOTATION_TRACK_HEIGHT }}
+              onScroll={event => setAnnotationScrollTop(event.currentTarget.scrollTop)}>
+              <div className="relative" style={{ height: annotationContentHeight }}>
+            {annotations.filter(annotation => {
+              const top = annotationLaneTop(annotationLanes.get(annotation.id) ?? 0)
+              return annotation.endTime + 28 / scale.pixelsPerSecond >= range.visibleStart && annotation.startTime <= range.visibleEnd
+                && top + ANNOTATION_LANE_HEIGHT >= annotationViewportTop && top < annotationViewportTop + ANNOTATION_TRACK_HEIGHT
+            }).map((annotation) => {
+              const left = scale.timeToX(annotation.startTime) - viewport.scrollLeft
               const annotationWidth = Math.max(28, (annotation.endTime - annotation.startTime) * scale.pixelsPerSecond)
               const isSelected = annotation.id === selectedId
               const lane = annotationLanes.get(annotation.id) ?? 0
+              const Icon = annotationIcons[annotation.type]
               return (
                 <div
                   key={annotation.id}
+                  data-annotation-id={annotation.id}
                   className="absolute z-20"
                   style={{
                     left,
@@ -1321,29 +1359,41 @@ export function Timeline({
                   <button
                     type="button"
                     aria-label={`Move ${annotation.label}`}
+                    aria-pressed={isSelected}
+                    title={`${ANNOTATION_NAMES[annotation.type]} · ${annotation.label}\n${formatTimecode(annotation.startTime, videoInfo.fps)} → ${formatTimecode(annotation.endTime, videoInfo.fps)}${annotation.visible ? "" : " · Скрыт"}\nНажмите для свойств; перетащите для переноса; края — длительность; Delete — удалить.`}
                     onPointerDown={dragAnnotationTime(annotation, "move")}
+                    onClick={() => onSelectAnnotation(annotation.id)}
+                    style={{ borderLeftColor: annotation.color, opacity: annotation.visible ? 1 : 0.5 }}
                     className={cn(
-                      "absolute inset-0 rounded-sm border text-[0px] transition-colors",
+                      "absolute inset-0 flex cursor-grab items-center gap-1.5 overflow-hidden rounded border border-l-4 px-2 text-xs text-foreground active:cursor-grabbing focus-visible:outline-2 focus-visible:outline-primary",
                       isSelected
-                        ? "border-primary/70 bg-primary/10"
-                        : "border-transparent bg-transparent hover:border-primary/35 hover:bg-primary/5",
+                        ? "border-primary bg-primary/25"
+                        : "border-border bg-secondary hover:border-primary/60",
                     )}
-                  />
-                  <button
+                  >
+                    <Icon className="size-3.5 shrink-0" />
+                    <span className="truncate">{ANNOTATION_NAMES[annotation.type]} · {annotation.label}</span>
+                    {!annotation.visible && <EyeOff className="size-3 shrink-0" />}
+                  </button>
+                  {annotation.type !== "crop" && isSelected && <><button
                     type="button"
                     aria-label={`Resize ${annotation.label} start`}
                     onPointerDown={dragAnnotationTime(annotation, "start")}
-                    className="absolute left-0 top-0 h-full w-1.5 cursor-ew-resize rounded-l-sm bg-primary/0 hover:bg-primary/70"
+                    tabIndex={-1}
+                    className="absolute left-0 top-0 h-full w-1.5 cursor-ew-resize rounded-l-sm bg-primary/40 hover:bg-primary"
                   />
                   <button
                     type="button"
                     aria-label={`Resize ${annotation.label} end`}
                     onPointerDown={dragAnnotationTime(annotation, "end")}
-                    className="absolute right-0 top-0 h-full w-1.5 cursor-ew-resize rounded-r-sm bg-primary/0 hover:bg-primary/70"
-                  />
+                    tabIndex={-1}
+                    className="absolute right-0 top-0 h-full w-1.5 cursor-ew-resize rounded-r-sm bg-primary/40 hover:bg-primary"
+                  /></>}
                 </div>
               )
             })}
+              </div>
+            </div>}
             {selectedClipId && <button type="button"
               className="absolute z-30 cursor-ew-resize"
               style={{

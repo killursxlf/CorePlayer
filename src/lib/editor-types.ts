@@ -77,6 +77,12 @@ export interface TimelineClip {
   sourceStart?: number
 }
 
+export const ANNOTATION_NAMES: Record<AnnotationType, string> = {
+  arrow: "Стрелка", rectangle: "Прямоугольник", circle: "Круг", text: "Текст",
+  blur: "Размытие", highlight: "Выделение", pen: "Перо", brush: "Кисть",
+  crop: "Кадрирование", measure: "Измерение",
+}
+
 export function formatTimecode(seconds: number, fps = 30): string {
   const s = Math.max(0, seconds)
   const hh = Math.floor(s / 3600)

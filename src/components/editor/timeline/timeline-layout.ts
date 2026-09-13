@@ -2,7 +2,7 @@ export const RULER_HEIGHT = 32
 export const VIDEO_ROW_HEIGHT = 88
 export const VIDEO_TRACK_TOP = RULER_HEIGHT + 8
 export const VIDEO_TRACK_HEIGHT = 72
-export const ANNOTATION_ROW_HEIGHT = 48
+export const ANNOTATION_ROW_HEIGHT = 136
 export const AUDIO_ROW_HEIGHT = 64
 export const SUBTITLE_ROW_HEIGHT = 40
 

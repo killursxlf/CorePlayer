@@ -327,7 +327,8 @@ function App() {
     (): ProjectSnapshot => ({
       selectedRange,
       playhead: playbackClock.getSnapshot(),
-      annotations: cloneAnnotations(annotations),
+      // Annotation edits replace objects/paths; history can share unchanged drawings.
+      annotations,
       markers: cloneMarkers(markers),
       clips: cloneClips(clips),
       selectedClipId,
@@ -341,7 +342,7 @@ function App() {
 
   const applySnapshot = useCallback(
     (snapshot: ProjectSnapshot) => {
-      setAnnotations(cloneAnnotations(snapshot.annotations))
+      setAnnotations(snapshot.annotations)
       setMarkers(cloneMarkers(snapshot.markers))
       setClips(cloneClips(snapshot.clips))
       setSelectedRange(snapshot.selectedRange)
@@ -736,6 +737,20 @@ function App() {
 
   const selected = annotations.find((a) => a.id === selectedId) ?? null
 
+  const selectAnnotation = useCallback((id: string | null) => {
+    setSelectedId(id)
+    if (!id) return
+    setSelectedRange(null)
+    setSelectedClipId(null)
+    setSelectedClipIds([])
+    setInspectorOpen(true)
+    setActiveTool("move")
+    setPlaying(false)
+    const annotation = annotations.find(a => a.id === id)
+    const time = playbackClock.getSnapshot()
+    if (annotation && (time < annotation.startTime || time >= annotation.endTime)) handleUserSeek(annotation.startTime, "precise")
+  }, [annotations, handleUserSeek, setPlaying])
+
   const updateSelected = useCallback(
     (patch: Partial<Annotation>) => {
       if (!selectedId) return
@@ -779,7 +794,7 @@ function App() {
     const endTime = Math.min(effectiveDuration, startTime + span)
     const pasted: Annotation = {
       ...source,
-      id: `a${Date.now()}`,
+      id: crypto.randomUUID(),
       label: `${source.label} Copy`,
       startTime,
       endTime,
@@ -788,6 +803,10 @@ function App() {
     }
     setAnnotations((prev) => [...prev, pasted])
     setSelectedId(pasted.id)
+    setSelectedRange(null)
+    setSelectedClipId(null)
+    setSelectedClipIds([])
+    setInspectorOpen(true)
     markUnsaved()
   }, [currentTime, effectiveDuration, hasMedia, markUnsaved, pushHistory])
 
@@ -797,6 +816,10 @@ function App() {
       pushHistory()
       setAnnotations((prev) => [...prev, annotation])
       setSelectedId(annotation.id)
+      setSelectedRange(null)
+      setSelectedClipId(null)
+      setSelectedClipIds([])
+      setInspectorOpen(true)
       markUnsaved()
     },
     [hasMedia, markUnsaved, pushHistory],
@@ -1399,7 +1422,7 @@ function App() {
               activeTool={activeTool}
               annotations={annotations}
               selectedId={selectedId}
-              onSelectAnnotation={setSelectedId}
+              onSelectAnnotation={selectAnnotation}
               onCreateAnnotation={createAnnotation}
               onEditStart={beginEdit}
               onUpdateAnnotation={patchAnnotation}
@@ -1459,7 +1482,7 @@ function App() {
                 onDeleteClip={deleteSelectedClip}
                 annotations={annotations}
                 selectedId={selectedId}
-                onSelectAnnotation={setSelectedId}
+                onSelectAnnotation={selectAnnotation}
                 onEditStart={beginEdit}
                 onUpdateAnnotation={patchAnnotation}
                 trim={trim}

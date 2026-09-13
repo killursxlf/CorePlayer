@@ -1,6 +1,6 @@
 "use client"
 
-import { useCallback, useEffect, useEffectEvent, useRef, useState } from "react"
+import { memo, useCallback, useEffect, useEffectEvent, useRef, useState } from "react"
 import {
   FileVideo,
   FolderOpen,
@@ -19,7 +19,7 @@ import {
 } from "lucide-react"
 import type { Annotation, AnnotationType, TimelineClip, ToolId, VideoInfo } from "@/lib/editor-types"
 import { clipAt, sourceStart, sourceTime, editTime } from "@/lib/timeline-edit"
-import { formatTimecode } from "@/lib/editor-types"
+import { ANNOTATION_NAMES, formatTimecode } from "@/lib/editor-types"
 import { cn } from "@/lib/utils"
 import { Slider } from "@/components/ui/slider"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
@@ -235,9 +235,9 @@ function buildAnnotation(
       : annotationBox(start, end)
   const visibleEnd = duration > 0 ? Math.min(duration, currentTime + 5) : currentTime + 5
   return {
-    id: `a${Date.now()}`,
+    id: crypto.randomUUID(),
     type,
-    label: type === "text" ? "Text" : type === "measure" ? "Measure" : type === "crop" ? "Crop" : type,
+    label: ANNOTATION_NAMES[type],
     color: style.color,
     opacity: style.opacity,
     thickness: style.thickness,
@@ -269,18 +269,18 @@ function pathData(points: NormalizedPoint[] | undefined) {
     .join(" ")
 }
 
-function AnnotationOverlay({
+const AnnotationOverlay = memo(function AnnotationOverlay({
   a,
   selected,
   activeTool,
-  onClick,
+  onSelect,
   onMoveStart,
   unitScale,
 }: {
   a: Annotation
   selected: boolean
   activeTool: ToolId
-  onClick: () => void
+  onSelect: (id: string) => void
   onMoveStart: (event: React.PointerEvent, annotation: Annotation) => void
   unitScale: number
 }) {
@@ -291,6 +291,8 @@ function AnnotationOverlay({
     width: `${a.width * 100}%`,
     height: `${a.height * 100}%`,
     opacity: a.opacity / 100,
+    pointerEvents: drawingTools.has(activeTool) ? "none" : "auto",
+    outline: selected ? "1px dashed var(--color-primary)" : undefined,
   }
   const ring = selected ? "0 0 0 2px var(--color-primary)" : "none"
   const points = linePoints(a)
@@ -299,13 +301,13 @@ function AnnotationOverlay({
     <button
       type="button"
       onPointerDown={(event) => {
-        if (activeTool === "move") {
+        if (activeTool === "move" || activeTool === "select") {
           onMoveStart(event, a)
         }
       }}
       onClick={(e) => {
         e.stopPropagation()
-        onClick()
+        onSelect(a.id)
       }}
       style={base}
       className="group/annotation cursor-pointer"
@@ -418,7 +420,7 @@ function AnnotationOverlay({
       )}
     </button>
   )
-}
+})
 
 function ControlButton({
   label,
@@ -696,6 +698,7 @@ export function Preview({
   const visibleAnnotations = annotations.filter(
     (a) => a.visible && currentTime >= a.startTime && currentTime < a.endTime,
   )
+  const selectedAnnotation = visibleAnnotations.find(a => a.id === selectedId)
 
   const toggleFullscreen = useCallback(() => {
     const preview = previewRef.current
@@ -730,13 +733,14 @@ export function Preview({
 
   const startToolDrag = useCallback(
     (event: React.PointerEvent<HTMLDivElement>) => {
-      if (videoInfo.hasVideo === false || !drawingTools.has(activeTool)) return
+      if (event.button !== 0 || videoInfo.hasVideo === false || !drawingTools.has(activeTool)) return
       const surface = videoSurfaceRef.current
       const type = annotationToolTypes[activeTool]
       if (!surface || !type) return
 
       event.preventDefault()
       event.stopPropagation()
+      if (isPlaying) onTogglePlay()
       surface.setPointerCapture(event.pointerId)
       const point = pointFromEvent(event, surface)
       setDidDragTool(false)
@@ -747,7 +751,7 @@ export function Preview({
         points: type === "brush" || type === "pen" ? [point] : undefined,
       })
     },
-    [activeTool, videoInfo.hasVideo],
+    [activeTool, isPlaying, onTogglePlay, videoInfo.hasVideo],
   )
 
   const updateToolDrag = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
@@ -799,7 +803,7 @@ export function Preview({
   const handleMoveStart = useCallback(
     (event: React.PointerEvent, annotation: Annotation) => {
       const surface = videoSurfaceRef.current
-      if (!surface) return
+      if (event.button !== 0 || !surface) return
 
       event.preventDefault()
       event.stopPropagation()
@@ -1393,11 +1397,18 @@ export function Preview({
                   a={a}
                   selected={a.id === selectedId}
                   activeTool={activeTool}
-                  onClick={() => onSelectAnnotation(a.id)}
+                  onSelect={onSelectAnnotation}
                   onMoveStart={handleMoveStart}
                   unitScale={surfaceSize.height / 540}
                 />
               ))}
+              {selectedAnnotation && !drawingTools.has(activeTool) && <button type="button"
+                aria-label="Переместить выбранный объект"
+                title="Перетащите для перемещения выбранного объекта. Escape — снять выделение."
+                className="absolute cursor-move border border-dashed border-primary bg-transparent"
+                style={{ left: `${selectedAnnotation.x * 100}%`, top: `${selectedAnnotation.y * 100}%`, width: `${selectedAnnotation.width * 100}%`, height: `${selectedAnnotation.height * 100}%` }}
+                onPointerDown={event => handleMoveStart(event, selectedAnnotation)}
+                onClick={event => event.stopPropagation()} />}
             </div>
           </div>
           {draft && <DraftOverlay draft={draft} />}
@@ -1412,7 +1423,7 @@ export function Preview({
             </div>
           )}
           {/* center play affordance */}
-          {!isPlaying && playbackUrl && (
+          {!isPlaying && playbackUrl && activeTool === "select" && !selectedId && (
             <span className="pointer-events-none absolute left-1/2 top-1/2 flex size-16 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-full bg-background/40 backdrop-blur-sm transition-opacity group-hover:opacity-100">
               <Play className="size-7 translate-x-0.5 text-foreground" />
             </span>

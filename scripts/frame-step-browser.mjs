@@ -70,7 +70,52 @@ try{
  await call('Runtime.enable');await call('Page.enable');await call('Page.addScriptToEvaluateOnNewDocument',{source:shim});await call('Emulation.setDeviceMetricsOverride',{width:1440,height:1000,deviceScaleFactor:1,mobile:false});
  await call('Page.navigate',{url:appUrl});await until('document.body.innerText.includes("Choose a video or audio file")');
  await ev('window.__audit.store=(await import("/src/stores/media-store.ts")).useMediaStore');
- if(process.argv.includes('--export-progress')) {
+ if(process.argv.includes('--annotations')) {
+  await open('vfr');
+  const save=async()=>{await ev('(document.activeElement.blur(),__audit.saved=null)');await key('s','KeyS',2);await until('__audit.saved!==null');return ev('__audit.saved');};
+  const mouse=(type,x,y)=>call('Input.dispatchMouseEvent',{type,x,y,button:type==='mouseMoved'?'none':'left',buttons:type==='mouseReleased'?0:1,clickCount:1});
+  const tap=async selector=>{const r=await ev(`(()=>{const e=document.querySelector(${JSON.stringify(selector)});e.scrollIntoView({block:'nearest'});const r=e.getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2}})()`);await mouse('mousePressed',r.x,r.y);await mouse('mouseReleased',r.x,r.y);};
+  const project=await save();
+  project.annotations=Array.from({length:1000},(_,i)=>({id:`stress-${i}`,type:'pen',label:`Рисунок ${i+1}`,color:'#3b82f6',opacity:100,thickness:2,font:'Inter',visible:true,startTime:0,endTime:5,x:(i%10)*.05,y:(Math.floor(i/10)%10)*.05,width:.2,height:.2,pathPoints:Array.from({length:32},(_,p)=>({x:p/31,y:(p%8)/7}))}));
+  await ev(`(__audit.saved=${JSON.stringify(project)},__audit.opens.push('timeline-test.json'))`);await key('o','KeyO',10);
+  await until(`document.querySelector('[aria-label="Объект на таймлайне"]')?.options.length===1001`);
+  assert.ok(await ev('document.querySelectorAll("[data-annotation-id]").length<=5'));
+  const pick=async id=>{await ev(`(()=>{const s=document.querySelector('[aria-label="Объект на таймлайне"]');s.value=${JSON.stringify(id)};s.dispatchEvent(new Event('change',{bubbles:true}))})()`);await until(`document.querySelector('[data-annotation-id="${id}"] button')?.getAttribute('aria-pressed')==='true'`);};
+  await ev('document.querySelector(\'[aria-label="Close inspector"]\')?.click()');await pick('stress-997');await until('document.querySelector("#annotation-label")?.value==="Рисунок 998"');
+  assert.ok(await ev('document.querySelector("[data-annotation-scroll]").scrollTop>30000'));report.thousandObjectsAndReveal=true;
+  await tap('#annotation-label');await ev('document.querySelector("#annotation-label").select()');await call('Input.insertText',{text:'Правка рисунка'});await ev('document.activeElement.blur()');
+  await tap('[aria-label="Показывать объект в кадре"]');
+  let saved=await save();assert.equal(saved.annotations[997].label,'Правка рисунка');assert.equal(saved.annotations[997].visible,false);assert.equal(saved.annotations[996].visible,true);
+  await key('z','KeyZ',2);await key('z','KeyZ',2);saved=await save();assert.equal(saved.annotations[997].label,'Рисунок 998');assert.equal(saved.annotations[997].visible,true);assert.deepEqual(saved.annotations[997].pathPoints,project.annotations[997].pathPoints);report.isolatedEditAndUndo=true;
+  await pick('stress-997');await key('c','KeyC',2);
+  await ev('(__audit.realNow=Date.now,Date.now=()=>1700000000000)');
+  for(let i=0;i<5;i++){await key('v','KeyV',2);await Bun.sleep(50);}
+  await ev('Date.now=__audit.realNow');saved=await save();assert.equal(saved.annotations.length,1005);assert.equal(new Set(saved.annotations.map(a=>a.id)).size,1005);report.rapidPasteUnique=true;
+  await key('Delete','Delete');saved=await save();assert.equal(saved.annotations.length,1004);assert.equal(saved.clips.length,1);await key('z','KeyZ',2);assert.equal((await save()).annotations.length,1005);report.deleteAndUndoOnlyObject=true;
+  await click('Pen');
+  const r=await ev(`(()=>{const r=document.querySelector('[aria-label="Video preview"]').getBoundingClientRect();return {x:r.x+r.width*.2,y:r.y+r.height*.2,w:r.width,h:r.height}})()`);
+  await mouse('mousePressed',r.x,r.y);for(let i=1;i<=12;i++)await mouse('mouseMoved',r.x+i*r.w*.02,r.y+i*r.h*.01);await mouse('mouseReleased',r.x+r.w*.24,r.y+r.h*.12);
+  saved=await save();assert.equal(saved.annotations.length,1006);assert.equal(saved.annotations.at(-1).type,'pen');report.drawOverExistingObjects=true;
+  await pick('stress-997');
+  const beforeMove=await save();
+  const handle=await ev(`(()=>{const r=document.querySelector('[aria-label="Переместить выбранный объект"]').getBoundingClientRect();return {x:r.x+10,y:r.y+10}})()`);
+  await until(`document.elementFromPoint(${handle.x},${handle.y})?.getAttribute('aria-label')==='Переместить выбранный объект'`);
+  await mouse('mousePressed',handle.x,handle.y);await mouse('mouseMoved',handle.x+20,handle.y+15);await mouse('mouseReleased',handle.x+20,handle.y+15);
+  saved=await save();assert.ok(saved.annotations[997].x>beforeMove.annotations[997].x);assert.equal(saved.annotations[998].x,beforeMove.annotations[998].x);await key('z','KeyZ',2);assert.deepEqual((await save()).annotations[997],beforeMove.annotations[997]);report.moveCoveredObject=true;
+  const bar=await ev(`(()=>{const e=document.querySelector('[data-annotation-id="stress-997"]');e.scrollIntoView({block:'nearest'});const r=e.getBoundingClientRect();return {x:r.x+40,y:r.y+14}})()`);
+  await mouse('mousePressed',bar.x,bar.y);await mouse('mouseMoved',bar.x+60,bar.y);await mouse('mouseReleased',bar.x+60,bar.y);
+  saved=await save();assert.ok(saved.annotations[997].startTime>0);assert.equal(saved.annotations[998].startTime,0);await key('z','KeyZ',2);assert.equal((await save()).annotations[997].startTime,0);report.moveTimingAndUndo=true;
+  await pick('stress-997');
+  const scrollBefore=await ev('document.querySelector("[data-annotation-scroll]").scrollTop');
+  const sr=await ev(`(()=>{const e=document.querySelector('[data-annotation-scroll]');e.scrollIntoView({block:'nearest'});const r=e.getBoundingClientRect();return {x:r.x+100,y:r.y+40}})()`);
+  await call('Input.dispatchMouseEvent',{type:'mouseWheel',x:sr.x,y:sr.y,deltaX:0,deltaY:-300});await until(`document.querySelector('[data-annotation-scroll]').scrollTop<${scrollBefore}`);report.scrollsObjectLanes=true;
+  const screenshot=await call('Page.captureScreenshot',{format:'png'});await writeFile(new URL('annotations-browser.png',root),Buffer.from(screenshot.data,'base64'));
+  await ev(`(__audit.saved=${JSON.stringify({...project,annotations:[],selectedAnnotationId:null})},__audit.opens.push('timeline-test.json'))`);await key('o','KeyO',10);await until('!document.querySelector("[data-annotation-scroll]")');
+  await click('Pen');const empty=await ev(`(()=>{const r=document.querySelector('[aria-label="Video preview"]').getBoundingClientRect();return {x:r.x+40,y:r.y+40}})()`);
+  await mouse('mousePressed',empty.x,empty.y);await mouse('mouseMoved',empty.x+60,empty.y+30);await mouse('mouseReleased',empty.x+60,empty.y+30);
+  await until('document.querySelectorAll("[data-annotation-id]").length===1');report.newDrawingAfterClearingScrolledTracks=true;
+  assert.equal(errors.length,0);report.errors=errors;console.log(JSON.stringify(report,null,2));
+ } else if(process.argv.includes('--export-progress')) {
   await open('vfr');await key('e','KeyE',2);
   await until('document.querySelector(\'[aria-label="Прогресс экспорта"]\') && __audit.export');
   const panel='document.querySelector(\'[aria-label="Прогресс экспорта"]\')';
@@ -157,4 +202,4 @@ try{
  await click('Next frame');await expectFrame(times[1]);assert.equal(await ev('__audit.calls.filter(c=>c.cmd==="get_frame_step").at(-1).args.inputPath'),fixtures.find(f=>f.name==='proxy').path);report.proxyUsesActualFrames=true;
  assert.equal(errors.length,0);report.errors=errors;console.log(JSON.stringify(report,null,2));
  }
-}finally{await writeFile(new URL(process.argv.includes('--export-progress')?'export-progress-results.json':process.argv.includes('--timeline')?'timeline-browser-results.json':'frame-browser-results.json',root),JSON.stringify(report,null,2));await send('Target.closeTarget',{targetId});ws.close();server.stop(true);}
+}finally{await writeFile(new URL(process.argv.includes('--annotations')?'annotations-browser-results.json':process.argv.includes('--export-progress')?'export-progress-results.json':process.argv.includes('--timeline')?'timeline-browser-results.json':'frame-browser-results.json',root),JSON.stringify(report,null,2));await send('Target.closeTarget',{targetId});ws.close();server.stop(true);}

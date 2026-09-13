@@ -3,7 +3,7 @@
 import { parseTimecode } from "@/utils/time"
 import { Info, SlidersHorizontal, Eye, EyeOff, Trash2, X } from "lucide-react"
 import type { Annotation, VideoInfo } from "@/lib/editor-types"
-import { formatClock, formatTimecode } from "@/lib/editor-types"
+import { ANNOTATION_NAMES, formatClock, formatTimecode } from "@/lib/editor-types"
 import { Slider } from "@/components/ui/slider"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
@@ -84,10 +84,10 @@ export function Inspector({ videoInfo, selected, onEditStart, onEditEnd, onChang
         ) : (
           <Info className="size-4 text-muted-foreground" />
         )}
-        <span className="text-sm font-medium">{selected ? "Properties" : "Inspector"}</span>
+        <span className="text-sm font-medium">{selected ? "Свойства" : "Inspector"}</span>
         {selected && (
           <span className="rounded-md bg-primary/15 px-1.5 py-0.5 text-[11px] font-medium text-primary">
-            {selected.type}
+            {ANNOTATION_NAMES[selected.type]}
           </span>
         )}
         <button
@@ -132,14 +132,15 @@ export function Inspector({ videoInfo, selected, onEditStart, onEditEnd, onChang
           </>
         ) : (
           <>
-            <Section title="Appearance">
+            <p className="text-xs leading-relaxed text-muted-foreground">Перетащите объект в кадре, чтобы изменить положение. На таймлайне тяните полосу для переноса, её края — для изменения длительности.</p>
+            <Section title="Внешний вид">
               <div className="space-y-3">
                 <div className="space-y-1.5">
-                  <Label htmlFor="annotation-label" className="text-xs text-muted-foreground">{selected.type === "text" ? "Text" : "Label"}</Label>
+                  <Label htmlFor="annotation-label" className="text-xs text-muted-foreground">{selected.type === "text" || selected.type === "measure" ? "Текст в кадре" : "Название на таймлайне"}</Label>
                   <Input id="annotation-label" value={selected.label} onChange={event => { onEditStart(); onChange({label: event.currentTarget.value}) }} />
                 </div>
-                <div className="space-y-1.5">
-                  <Label className="text-xs text-muted-foreground">Color</Label>
+                {selected.type !== "blur" && selected.type !== "crop" && <div className="space-y-1.5">
+                  <Label className="text-xs text-muted-foreground">Цвет</Label>
                   <div className="flex flex-wrap gap-1.5">
                     {COLORS.map((c) => (
                       <button
@@ -155,11 +156,11 @@ export function Inspector({ videoInfo, selected, onEditStart, onEditEnd, onChang
                       />
                     ))}
                   </div>
-                </div>
+                </div>}
 
                 <div className="space-y-1.5">
                   <div className="flex items-center justify-between">
-                    <Label className="text-xs text-muted-foreground">Opacity</Label>
+                    <Label className="text-xs text-muted-foreground">Непрозрачность</Label>
                     <span className="font-mono text-xs tabular-nums text-foreground">{selected.opacity}%</span>
                   </div>
                   <Slider
@@ -171,9 +172,9 @@ export function Inspector({ videoInfo, selected, onEditStart, onEditEnd, onChang
                   />
                 </div>
 
-                <div className="space-y-1.5">
+                {selected.type !== "crop" && selected.type !== "highlight" && <div className="space-y-1.5">
                   <div className="flex items-center justify-between">
-                    <Label className="text-xs text-muted-foreground">Thickness</Label>
+                    <Label className="text-xs text-muted-foreground">{selected.type === "blur" ? "Сила размытия" : selected.type === "text" ? "Размер текста" : "Толщина"}</Label>
                     <span className="font-mono text-xs tabular-nums text-foreground">{selected.thickness}px</span>
                   </div>
                   <Slider
@@ -183,10 +184,10 @@ export function Inspector({ videoInfo, selected, onEditStart, onEditEnd, onChang
                     step={1}
                     onValueChange={(v) => onChange({ thickness: Array.isArray(v) ? v[0] : v })}
                   />
-                </div>
+                </div>}
 
-                <div className="space-y-1.5">
-                  <Label className="text-xs text-muted-foreground">Font</Label>
+                {selected.type === "text" && <div className="space-y-1.5">
+                  <Label className="text-xs text-muted-foreground">Шрифт</Label>
                   <Select value={selected.font} onValueChange={(v) => v && onChange({ font: v })}>
                     <SelectTrigger size="sm" className="w-full">
                       <SelectValue />
@@ -199,7 +200,7 @@ export function Inspector({ videoInfo, selected, onEditStart, onEditEnd, onChang
                       ))}
                     </SelectContent>
                   </Select>
-                </div>
+                </div>}
 
                 <div className="flex items-center justify-between rounded-lg bg-secondary/50 px-2.5 py-2">
                   <div className="flex items-center gap-2">
@@ -208,9 +209,10 @@ export function Inspector({ videoInfo, selected, onEditStart, onEditEnd, onChang
                     ) : (
                       <EyeOff className="size-4 text-muted-foreground" />
                     )}
-                    <Label className="text-sm">Visible</Label>
+                    <Label className="text-sm">Показывать в кадре</Label>
                   </div>
                   <Switch
+                    aria-label="Показывать объект в кадре"
                     checked={selected.visible}
                     onCheckedChange={(v) => onChange({ visible: v })}
                   />
@@ -218,10 +220,11 @@ export function Inspector({ videoInfo, selected, onEditStart, onEditEnd, onChang
               </div>
             </Section>
 
-            <Section title="Timing">
+            <Section title="Время на таймлайне">
+              <p className="mb-2 text-xs text-muted-foreground">{selected.type === "crop" ? "Кадрирование применяется ко всему ролику." : `Длительность: ${(selected.endTime - selected.startTime).toFixed(2)} с · чч:мм:сс:кадр`}</p>
               <div className="grid grid-cols-2 gap-2">
                 <div className="space-y-1.5">
-                  <Label className="text-xs text-muted-foreground">Start</Label>
+                  <Label className="text-xs text-muted-foreground">Начало</Label>
                   <Input
                     key={selected.id + ":startTime:" + selected.startTime}
                     aria-label="Annotation start time"
@@ -240,7 +243,7 @@ export function Inspector({ videoInfo, selected, onEditStart, onEditEnd, onChang
                   />
                 </div>
                 <div className="space-y-1.5">
-                  <Label className="text-xs text-muted-foreground">End</Label>
+                  <Label className="text-xs text-muted-foreground">Конец</Label>
                   <Input
                     key={selected.id + ":endTime:" + selected.endTime}
                     aria-label="Annotation end time"
@@ -267,7 +270,7 @@ export function Inspector({ videoInfo, selected, onEditStart, onEditEnd, onChang
               onClick={onDelete}
             >
               <Trash2 className="size-4" />
-              Delete annotation
+              Удалить объект
             </Button>
           </>
         )}

@@ -38,7 +38,10 @@ const shim=`(()=>{
  window.__TAURI_INTERNALS__={metadata:{currentWindow:{label:'main'},currentWebview:{label:'main'}},transformCallback(fn){const id=Object.keys(__audit.callbacks).length+1;__audit.callbacks[id]=fn;return id;},convertFileSrc(path){return path;},async invoke(cmd,args){
   __audit.calls.push({cmd,args});
   if(cmd==='plugin:dialog|open')return __audit.opens.shift()??null;
-  if(cmd==='plugin:dialog|save')return 'timeline-test.json';
+  if(cmd==='plugin:dialog|save')return __audit.cancelSave?null:'timeline-test.json';
+  if(cmd==='plugin:event|listen' && args.event==='export-progress'){__audit.exportCallback=args.handler;return 1;}
+  if(cmd==='export_trim'){__audit.export=args.request;return {operationId:args.request.operationId,outputPath:args.request.outputPath};}
+  if(cmd==='cancel_export'){setTimeout(()=>__audit.emitExport({progress:0,status:'cancelled'}),200);return null;}
   if(cmd==='write_text_file'){__audit.saved=JSON.parse(args.contents);return null;}
   if(cmd==='read_text_file')return JSON.stringify(__audit.saved);
   if(cmd==='get_runtime_performance_config'||cmd==='update_runtime_metrics')return config;
@@ -58,6 +61,7 @@ const shim=`(()=>{
   }
   return null;
  }};
+ __audit.emitExport=payload=>__audit.callbacks[__audit.exportCallback]({event:'export-progress',id:1,payload:{operationId:__audit.export.operationId,...payload}});
  const observed=new WeakSet();new MutationObserver(()=>{const video=document.querySelector('video');if(!video||observed.has(video))return;observed.add(video);const observe=(_now,meta)=>{__audit.shown={time:meta.mediaTime,src:video.src};video.requestVideoFrameCallback(observe);};video.requestVideoFrameCallback(observe);}).observe(document,{childList:true,subtree:true});
 })();`;
 const open=async name=>{await ev(`(__audit.shown=null,__audit.opens.push(__audit.fixtures.find(f=>f.name===${JSON.stringify(name)}).path))`);await key('o','KeyO',2);await until('document.querySelector("video")?.readyState>=2 && __audit.shown!==null');};
@@ -66,7 +70,27 @@ try{
  await call('Runtime.enable');await call('Page.enable');await call('Page.addScriptToEvaluateOnNewDocument',{source:shim});await call('Emulation.setDeviceMetricsOverride',{width:1440,height:1000,deviceScaleFactor:1,mobile:false});
  await call('Page.navigate',{url:appUrl});await until('document.body.innerText.includes("Choose a video or audio file")');
  await ev('window.__audit.store=(await import("/src/stores/media-store.ts")).useMediaStore');
- if(process.argv.includes('--timeline')) {
+ if(process.argv.includes('--export-progress')) {
+  await open('vfr');await key('e','KeyE',2);
+  await until('document.querySelector(\'[aria-label="Прогресс экспорта"]\') && __audit.export');
+  const panel='document.querySelector(\'[aria-label="Прогресс экспорта"]\')';
+  await ev('(__audit.clock=Date.now.bind(Date),__audit.offset=0,Date.now=()=>__audit.clock()+__audit.offset)');
+  await ev('__audit.emitExport({progress:.1,status:"exporting",message:"Exporting Монтаж"})');
+  await until(`${panel}.innerText.includes('10%')`);
+  await ev('(__audit.offset=5000,__audit.emitExport({progress:.4,status:"exporting",message:"Exporting Монтаж"}))');
+  await until(`${panel}.innerText.includes('Осталось около') && ${panel}.innerText.includes('40%')`);report.realProgressAndEstimate=true;
+  await ev('__audit.offset=25000');await until(`${panel}.innerText.includes('Прогресс не менялся')`);
+  assert.equal(await ev('document.querySelector("progress").value'),.4);report.stallDoesNotFakeProgress=true;
+  await ev('__audit.emitExport({progress:.05,status:"exporting",message:"Exporting Монтаж"})');await until(`${panel}.innerText.includes('5%') && ${panel}.innerText.includes('Оцениваем время')`);report.retryResetsEstimate=true;
+  await ev('__audit.emitExport({progress:.99,status:"exporting"})');await until(`${panel}.innerText.includes('Сохранение результата')`);assert.ok(!(await ev(`${panel}.innerText`)).includes('100%'));report.waitsForFilePublication=true;
+  const screenshot=await call('Page.captureScreenshot',{format:'png'});await writeFile(new URL('export-progress-browser.png',root),Buffer.from(screenshot.data,'base64'));
+  await ev('__audit.emitExport({progress:1,status:"completed"})');await until(`${panel}.innerText.includes('Экспорт завершён') && ${panel}.innerText.includes('100%')`);await click('Закрыть прогресс экспорта');await until(`!${panel}`);report.completion=true;
+  await key('e','KeyE',2);await until(`${panel} && __audit.store.getState().exportStatus==='exporting'`);
+  await ev(`Array.from(document.querySelectorAll('button')).find(b=>b.textContent==='Отменить экспорт').click()`);await until(`${panel}.innerText.includes('Ожидаем остановки')`);await until(`${panel}.innerText.includes('Экспорт отменён')`);report.cancellation=true;
+  await key('e','KeyE',2);await until('__audit.store.getState().exportStatus==="exporting"');await ev('__audit.emitExport({progress:0,status:"failed",message:"Disk full"})');await until(`${panel}.innerText.includes('Не удалось экспортировать') && ${panel}.innerText.includes('Disk full')`);report.failure=true;
+  await ev('__audit.cancelSave=true');await key('e','KeyE',2);await until(`!${panel} && __audit.store.getState().exportStatus==='idle'`);report.dialogCancellation=true;
+  assert.equal(errors.length,0);report.errors=errors;console.log(JSON.stringify(report,null,2));
+ } else if(process.argv.includes('--timeline')) {
   await open('vfr');
   const clipSelector='button[aria-label^="Клип "]';
   const save=async()=>{await ev('__audit.saved=null');await key('s','KeyS',2);await until('__audit.saved!==null');return ev('__audit.saved');};
@@ -133,4 +157,4 @@ try{
  await click('Next frame');await expectFrame(times[1]);assert.equal(await ev('__audit.calls.filter(c=>c.cmd==="get_frame_step").at(-1).args.inputPath'),fixtures.find(f=>f.name==='proxy').path);report.proxyUsesActualFrames=true;
  assert.equal(errors.length,0);report.errors=errors;console.log(JSON.stringify(report,null,2));
  }
-}finally{await writeFile(new URL(process.argv.includes('--timeline')?'timeline-browser-results.json':'frame-browser-results.json',root),JSON.stringify(report,null,2));await send('Target.closeTarget',{targetId});ws.close();server.stop(true);}
+}finally{await writeFile(new URL(process.argv.includes('--export-progress')?'export-progress-results.json':process.argv.includes('--timeline')?'timeline-browser-results.json':'frame-browser-results.json',root),JSON.stringify(report,null,2));await send('Target.closeTarget',{targetId});ws.close();server.stop(true);}

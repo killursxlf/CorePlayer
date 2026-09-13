@@ -14,6 +14,7 @@ import { Inspector } from "@/components/editor/inspector"
 import { Timeline } from "@/components/editor/timeline"
 import { StatusBar } from "@/components/editor/status-bar"
 import { ExportSettingsPanel } from "@/components/editor/export-settings-panel"
+import { ExportProgressPanel, type ExportFeedback } from "@/components/editor/export-progress-panel"
 import { ErrorNotice } from "@/components/feedback/error-notice"
 import { getMediaService } from "@/services/media-service-provider"
 import { toMediaServiceError } from "@/services/media-service"
@@ -150,6 +151,7 @@ function App() {
   }, [])
   const [projectPath, setProjectPath] = useState<string | null>(null)
   const [exportOperationId, setExportOperationId] = useState<string | null>(null)
+  const [exportFeedback, setExportFeedback] = useState<ExportFeedback | null>(null)
   const [mediaDetails, setMediaDetails] = useState<VideoInfo>(EMPTY_VIDEO_INFO)
   const [mediaSession, setMediaSession] = useState(0)
   const [inspectorOpen, setInspectorOpen] = useState(true)
@@ -924,6 +926,9 @@ function App() {
     setError(null)
     setExportProgress(0)
     setExportStatus("preparing")
+    const startedAt = Date.now()
+    setExportFeedback({ startedAt, updatedAt: startedAt, advancedAt: startedAt, sampleAt: null, sampleProgress: 0, progress: 0, message: "Выберите файл для сохранения. Затем начнётся подготовка кодировщика.", outputPath: "", cancelling: false })
+    setExportSettingsOpen(false)
 
     let terminal = false
     try {
@@ -938,6 +943,15 @@ function App() {
           },
         (progress) => {
           if (terminal) return
+          const now = Date.now()
+          setExportFeedback(previous => previous ? {
+            ...previous, updatedAt: now,
+            advancedAt: progress.progress !== previous.progress ? now : previous.advancedAt,
+            sampleAt: previous.sampleAt === null || progress.progress < previous.progress ? now : previous.sampleAt,
+            sampleProgress: previous.sampleAt === null || progress.progress < previous.progress ? progress.progress : previous.sampleProgress,
+            progress: progress.progress,
+            message: progress.status === "completed" ? "Результат сохранён" : progress.status === "cancelled" ? "Экспорт остановлен" : progress.message ?? previous.message,
+          } : null)
           if (progress.operationId) setExportOperationId(progress.operationId)
           setExportProgress(progress.progress)
 
@@ -966,8 +980,11 @@ function App() {
 
       if (!started.operationId) {
         setExportStatus("idle")
+        setExportFeedback(null)
         return
       }
+
+      setExportFeedback(previous => previous ? { ...previous, outputPath: started.outputPath, message: previous.sampleAt === null && !terminal ? "Кодировщик запущен. Ожидаем первые кадры…" : previous.message } : null)
 
       if (!terminal) {
         setExportOperationId(started.operationId)
@@ -976,6 +993,7 @@ function App() {
     } catch (error) {
       setExportOperationId(null)
       setExportStatus("failed")
+      setExportFeedback(previous => previous ? { ...previous, updatedAt: Date.now(), message: toMediaServiceError(error).message, cancelling: false } : null)
       setError(toMediaServiceError(error))
     }
   }, [
@@ -993,10 +1011,12 @@ function App() {
   const handleCancelExport = useCallback(async () => {
     if (!exportOperationId) return
 
+    setExportFeedback(previous => previous ? { ...previous, cancelling: true } : null)
     try {
       await mediaService.cancelOperation(exportOperationId)
       // Wait for the terminal event before enabling another export.
     } catch (error) {
+      setExportFeedback(previous => previous ? { ...previous, cancelling: false } : null)
       setError(toMediaServiceError(error))
     }
   }, [exportOperationId, mediaService, setError])
@@ -1225,12 +1245,10 @@ function App() {
     undo,
   ])
 
-  /* eslint-disable react-hooks/refs -- historyVersion explicitly invalidates these command-state refs. */
   const canUndo = historyVersion >= 0 && undoStackRef.current.length > 0
   const canRedo = historyVersion >= 0 && redoStackRef.current.length > 0
   const canEditSelected = Boolean(selectedId)
   const canPasteAnnotation = Boolean(annotationClipboardRef.current && hasMedia)
-  /* eslint-enable react-hooks/refs */
   const currentFrame = Math.floor(currentTime * videoInfo.fps)
   const statusLabel = exportStatus === "idle" ? "Ready" : exportStatus
   const appTitle = projectPath
@@ -1261,6 +1279,10 @@ function App() {
           </section>
         </div>
       )}
+      {exportFeedback && exportStatus !== "idle" && <ExportProgressPanel
+        status={exportStatus} progress={exportProgress} feedback={exportFeedback}
+        canCancel={exportOperationId !== null} onCancel={handleCancelExport} onClose={() => setExportFeedback(null)}
+      />}
       <MenuBar
         hasMedia={hasMedia}
         hasRecent={Boolean(recentMediaPath)}

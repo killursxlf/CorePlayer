@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "prepare:ffmpeg": "pwsh -NoProfile -File scripts/prepare-ffmpeg.ps1",
+    "prepare:ffmpeg": "bun -e \"process.exit(Bun.spawnSync([Bun.which('pwsh') ?? 'powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', 'scripts/prepare-ffmpeg.ps1'], {stdout:'inherit', stderr:'inherit'}).exitCode)\"",
     "build:installer": "bunx tauri build --bundles nsis",
     "dev": "vite",
     "build": "tsc -b && vite build",

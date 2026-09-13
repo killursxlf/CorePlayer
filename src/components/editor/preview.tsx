@@ -19,7 +19,7 @@ import {
 } from "lucide-react"
 import type { Annotation, AnnotationType, TimelineClip, ToolId, VideoInfo } from "@/lib/editor-types"
 import { clipAt, sourceStart, sourceTime, editTime } from "@/lib/timeline-edit"
-import { ANNOTATION_NAMES, formatTimecode } from "@/lib/editor-types"
+import { ANNOTATION_NAMES, PLAYBACK_SPEEDS, formatTimecode } from "@/lib/editor-types"
 import { cn } from "@/lib/utils"
 import { Slider } from "@/components/ui/slider"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
@@ -31,7 +31,6 @@ import { FrameStepQueue } from "@/lib/frame-step-queue"
 import { getMediaService } from "@/services/media-service-provider"
 import { toMediaServiceError } from "@/services/media-service"
 
-const SPEEDS = ["0.25", "0.5", "1", "1.5", "2"]
 
 interface PreviewProps {
   clips: TimelineClip[]
@@ -687,7 +686,7 @@ export function Preview({
       const style = getComputedStyle(container)
       const width = Math.max(1, container.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight))
       const height = Math.max(1, container.clientHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom))
-      const fitWidth = Math.min(width, height * mediaAspect, isFullscreen ? Infinity : 1024)
+      const fitWidth = Math.min(width, height * mediaAspect)
       setSurfaceSize({width: fitWidth, height: fitWidth / mediaAspect})
     }
     const observer = new ResizeObserver(resize)
@@ -1322,7 +1321,7 @@ export function Preview({
       {/* Video canvas */}
       <div
         ref={containerRef}
-        className={cn("flex min-h-0 flex-1 items-center justify-center overflow-hidden p-6", isFullscreen && "p-4")}
+        className="flex min-h-0 flex-1 items-center justify-center overflow-hidden p-2"
         onWheel={handleFullscreenWheel}
       >
         <div
@@ -1343,14 +1342,15 @@ export function Preview({
           }}
           onKeyDown={(e) => {
             if (e.key === "Escape") onSelectAnnotation(null)
-            if (e.code === "Space" || e.key === "Enter") {
+            if (e.key === "Enter" && e.target === e.currentTarget) {
               e.preventDefault()
+              e.stopPropagation()
               onTogglePlay()
             }
           }}
           className={cn(
             "group relative shrink-0 cursor-default overflow-hidden rounded-xl bg-black shadow-2xl ring-1 ring-border",
-            isFullscreen ? "max-w-none rounded-none" : "max-w-5xl",
+            isFullscreen && "rounded-none",
           )}
           style={{
             width: surfaceSize.width,
@@ -1509,10 +1509,12 @@ export function Preview({
             <select
               value={playbackSpeed}
               onChange={(event) => onPlaybackSpeedChange(event.currentTarget.value)}
-              className="h-8 w-[76px] rounded-lg border border-transparent bg-secondary/60 px-2 text-sm text-foreground outline-none transition-colors hover:bg-secondary/80 focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/40"
+              className="h-8 w-24 rounded-lg border border-transparent bg-secondary/60 px-2 text-sm text-foreground outline-none transition-colors hover:bg-secondary/80 focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/40"
               aria-label="Playback speed"
+              title="Скорость просмотра · Ctrl + ← / →"
             >
-              {SPEEDS.map((speed) => (
+              {!PLAYBACK_SPEEDS.some(speed => speed === Number(playbackSpeed)) && <option value={playbackSpeed}>{playbackSpeed}x</option>}
+              {PLAYBACK_SPEEDS.map((speed) => (
                 <option key={speed} value={speed}>
                   {speed}x
                 </option>

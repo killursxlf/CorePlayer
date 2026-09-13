@@ -1,3 +1,7 @@
+export const PLAYBACK_SPEEDS = [0.125, 0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.5, 3, 4, 6, 8] as const
+export const MIN_PLAYBACK_SPEED = PLAYBACK_SPEEDS[0]
+export const MAX_PLAYBACK_SPEED = PLAYBACK_SPEEDS[PLAYBACK_SPEEDS.length - 1]
+
 export type ToolId =
   | "select"
   | "move"

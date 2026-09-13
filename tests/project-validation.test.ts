@@ -9,6 +9,10 @@ test("old minimal projects receive complete export defaults", () => {
   expect(parsed.exportSettings).toEqual(DEFAULT_EXPORT_SETTINGS)
   expect(parsed.volume).toBe(1)
 })
+test("extended playback speeds survive project loading without accepting invalid rates", () => {
+  for (const playbackRate of [0.125, 0.75, 3, 6, 8]) expect(parseProject(JSON.stringify({...project, playbackRate})).playbackRate).toBe(playbackRate)
+  for (const playbackRate of [0.01, 9, "fast"]) expect(() => parseProject(JSON.stringify({...project, playbackRate}))).toThrow()
+})
 test.each([null, [], { ...project, mediaPath: 1 }, { ...project, clips: [null] },
   { ...project, clips: [{ ...project.clips[0], endTime: -1 }] },
   { ...project, clips: [project.clips[0], project.clips[0]] },

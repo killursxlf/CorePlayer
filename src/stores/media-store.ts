@@ -1,4 +1,5 @@
 import { create } from "zustand"
+import { MIN_PLAYBACK_SPEED, MAX_PLAYBACK_SPEED } from "@/lib/editor-types"
 import type { AppError } from "@/types/app-error"
 import type { ExportStatus, MediaState, OpenMediaResult } from "@/types/media"
 
@@ -87,7 +88,7 @@ export const useMediaStore = create<MediaStore>((set, get) => ({
     }),
 
   setVolume: (volume) => set({ volume: clamp(volume, 0, 1) }),
-  setPlaybackRate: (playbackRate) => set({ playbackRate: clamp(playbackRate, 0.25, 4) }),
+  setPlaybackRate: (playbackRate) => set({ playbackRate: Number.isFinite(playbackRate) ? clamp(playbackRate, MIN_PLAYBACK_SPEED, MAX_PLAYBACK_SPEED) : 1 }),
   setPlaying: (isPlaying) => set({ isPlaying }),
   setLoading: (isLoading) => set({ isLoading }),
 

@@ -30,6 +30,8 @@ import { usePerformanceStore } from "@/stores/performance-store"
 import { playbackClock } from "@/stores/playback-clock"
 import { createAppError } from "@/types/app-error"
 import { isValidTrimRange } from "@/utils/time"
+import { cn } from "@/lib/utils"
+import { PLAYBACK_SPEEDS } from "@/lib/editor-types"
 import type { Annotation, TimelineClip, TimelineMarker, ToolId, VideoInfo } from "@/lib/editor-types"
 import { DEFAULT_EXPORT_SETTINGS } from "@/lib/export-settings"
 import type { ExportSettings } from "@/types/export"
@@ -50,7 +52,6 @@ const EMPTY_VIDEO_INFO: VideoInfo = {
 const INITIAL_ANNOTATIONS: Annotation[] = []
 
 const INITIAL_MARKERS: TimelineMarker[] = []
-const PLAYBACK_SPEEDS = [0.25, 0.5, 1, 1.5, 2] as const
 
 type ProjectSnapshot = {
   selectedRange: TimeRange | null
@@ -130,7 +131,7 @@ function isTextEditingTarget(target: HTMLElement | null) {
 
 function App() {
   const [activeTool, setActiveTool] = useState<ToolId>("select")
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(true)
   const [zoom, setZoom] = useState(100)
   const [saved, setSaved] = useState(true)
   const editRevisionRef = useRef(0)
@@ -154,7 +155,7 @@ function App() {
   const [exportFeedback, setExportFeedback] = useState<ExportFeedback | null>(null)
   const [mediaDetails, setMediaDetails] = useState<VideoInfo>(EMPTY_VIDEO_INFO)
   const [mediaSession, setMediaSession] = useState(0)
-  const [inspectorOpen, setInspectorOpen] = useState(true)
+  const [inspectorOpen, setInspectorOpen] = useState(false)
   const [timelineVisible, setTimelineVisible] = useState(true)
   const [videoCacheId, setVideoCacheId] = useState<string | null>(null)
   const [thumbnailCacheDir, setThumbnailCacheDir] = useState<string | null>(null)
@@ -1052,10 +1053,11 @@ function App() {
       if (discardDialog || useMediaStore.getState().isLoading) return
       const target = event.target as HTMLElement | null
 
-      if (hasMedia && event.code === "Space" && !event.repeat && !isTextEditingTarget(target)) {
+      if (hasMedia && event.code === "Space" && !event.ctrlKey && !event.metaKey && !event.altKey
+        && (target?.tagName === "SELECT" || !isTextEditingTarget(target))) {
         event.preventDefault()
         event.stopPropagation()
-        setPlaying(!isPlaying)
+        if (!event.repeat) setPlaying(!useMediaStore.getState().isPlaying)
         return
       }
 
@@ -1233,7 +1235,20 @@ function App() {
     }
 
     document.addEventListener("keydown", handleKeyDown, { capture: true })
-    return () => document.removeEventListener("keydown", handleKeyDown, { capture: true })
+    const handleKeyUp = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null
+      if (!discardDialog && hasMedia && !useMediaStore.getState().isLoading && event.code === "Space"
+        && !event.ctrlKey && !event.metaKey && !event.altKey
+        && (target?.tagName === "SELECT" || !isTextEditingTarget(target))) {
+        event.preventDefault()
+        event.stopPropagation()
+      }
+    }
+    document.addEventListener("keyup", handleKeyUp, { capture: true })
+    return () => {
+      document.removeEventListener("keydown", handleKeyDown, { capture: true })
+      document.removeEventListener("keyup", handleKeyUp, { capture: true })
+    }
   }, [
     discardDialog,
     markUnsaved,
@@ -1454,7 +1469,7 @@ function App() {
           </div>
 
           {hasMedia && timelineVisible && (
-            <div className="h-72 shrink-0 border-t border-border">
+            <div className={cn("shrink-0 border-t border-border", annotations.length ? "h-72" : "h-56")}>
               <Timeline
                 sourceDuration={duration}
                 selectedRange={selectedRange}

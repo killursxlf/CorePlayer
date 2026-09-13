@@ -1,4 +1,5 @@
 import type { ProjectFile } from "@/services/project-service"
+import { MIN_PLAYBACK_SPEED, MAX_PLAYBACK_SPEED } from "./editor-types"
 import { compatibleExportSettings, DEFAULT_EXPORT_SETTINGS } from "./export-settings"
 
 function check(condition: unknown): asserts condition {
@@ -79,7 +80,7 @@ export function parseProject(contents: string): ProjectFile {
   check(settings.crf === null || (number(settings.crf, 0, 63) && Number.isInteger(settings.crf)))
   const volume = value.volume ?? 1
   const playbackRate = value.playbackRate ?? 1
-  check(number(volume, 0, 1) && number(playbackRate, 0.25, 4))
+  check(number(volume, 0, 1) && number(playbackRate, MIN_PLAYBACK_SPEED, MAX_PLAYBACK_SPEED))
   const selectedClipIds = items(value.selectedClipIds ?? [])
   check(selectedClipIds.every(text))
   for (const key of ["selectedClipId", "selectedAnnotationId"]) check(value[key] == null || text(value[key]))

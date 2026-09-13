@@ -70,7 +70,40 @@ try{
  await call('Runtime.enable');await call('Page.enable');await call('Page.addScriptToEvaluateOnNewDocument',{source:shim});await call('Emulation.setDeviceMetricsOverride',{width:1440,height:1000,deviceScaleFactor:1,mobile:false});
  await call('Page.navigate',{url:appUrl});await until('document.body.innerText.includes("Choose a video or audio file")');
  await ev('window.__audit.store=(await import("/src/stores/media-store.ts")).useMediaStore');
- if(process.argv.includes('--annotations')) {
+ if(process.argv.includes('--playback-controls')) {
+  await open('vfr');
+  const focus=selector=>ev(`document.querySelector(${JSON.stringify(selector)}).focus()`);
+  const paused='!__audit.store.getState().isPlaying && document.querySelector("video").paused';
+  const playing='__audit.store.getState().isPlaying && !document.querySelector("video").paused';
+  for(const selector of ['[aria-label="Playback speed"]','[aria-label="Pen"]','[aria-label="Video preview"]','[aria-label="Trim start"]']) {
+    await focus(selector);await key(' ','Space');await until(playing);await key(' ','Space');await until(paused);
+  }
+  assert.equal(await ev('document.querySelector(\'[aria-label="Pen"]\').getAttribute("aria-pressed")'),'false');
+  assert.equal(await ev('__audit.store.getState().playbackRate'),1);report.spaceFromControls=true;
+  await focus('[aria-label="Pen"]');await call('Input.dispatchKeyEvent',{type:'keyDown',key:' ',code:'Space'});
+  for(let i=0;i<6;i++)await call('Input.dispatchKeyEvent',{type:'keyDown',key:' ',code:'Space',autoRepeat:true});
+  await call('Input.dispatchKeyEvent',{type:'keyUp',key:' ',code:'Space'});await until(playing);
+  assert.equal(await ev('document.querySelector(\'[aria-label="Pen"]\').getAttribute("aria-pressed")'),'false');
+  await key(' ','Space');await until(paused);report.holdingSpaceDoesNotActivateButton=true;
+  for(const speed of [0.125,0.75,1.25,3,6,8]) {
+    await ev(`(()=>{const s=document.querySelector('[aria-label="Playback speed"]');s.focus();s.value='${speed}';s.dispatchEvent(new Event('change',{bubbles:true}))})()`);
+    await until(`document.querySelector('video').playbackRate===${speed}`);
+  }
+  await key(' ','Space');await until(playing);assert.equal(await ev('__audit.store.getState().playbackRate'),8);await key(' ','Space');await until(paused);
+  await ev('document.activeElement.blur()');await key('s','KeyS',2);await until('__audit.saved?.playbackRate===8');
+  await ev('__audit.opens.push("timeline-test.json")');await key('o','KeyO',10);await until('document.querySelector("video")?.readyState>=2 && document.querySelector("video").playbackRate===8');report.extendedSpeedsAndRestore=true;
+  await ev('document.activeElement.blur()');await key('ArrowLeft','ArrowLeft',2);await until('__audit.store.getState().playbackRate===6');await key('ArrowRight','ArrowRight',2);await until('__audit.store.getState().playbackRate===8');report.speedShortcuts=true;
+  const size=await ev(`(()=>{const e=document.querySelector('[aria-label="Video preview"]'),r=e.getBoundingClientRect(),p=e.parentElement;return {width:r.width,height:r.height,availableWidth:p.clientWidth-16,availableHeight:p.clientHeight-16}})()`);
+  assert.ok(size.width>850,JSON.stringify(size));assert.ok(Math.abs(size.width/size.height-16/9)<.01);assert.ok(size.width<=size.availableWidth+1 && size.height<=size.availableHeight+1);report.previewSize=size;
+  await call('Emulation.setDeviceMetricsOverride',{width:1920,height:1200,deviceScaleFactor:1,mobile:false});await until('document.querySelector(\'[aria-label="Video preview"]\').getBoundingClientRect().width>1100');report.largePreviewNotCapped=true;
+  await click('Text');const r=await ev(`(()=>{const r=document.querySelector('[aria-label="Video preview"]').getBoundingClientRect();return {x:r.x+30,y:r.y+30}})()`);
+  await call('Input.dispatchMouseEvent',{type:'mousePressed',x:r.x,y:r.y,button:'left',buttons:1,clickCount:1});await call('Input.dispatchMouseEvent',{type:'mouseMoved',x:r.x+100,y:r.y+40,buttons:1});await call('Input.dispatchMouseEvent',{type:'mouseReleased',x:r.x+100,y:r.y+40,button:'left',buttons:0,clickCount:1});
+  await until('!!document.querySelector("#annotation-label")');await focus('#annotation-label');
+  assert.equal(await ev(`(()=>{const e=new KeyboardEvent('keydown',{code:'Space',key:' ',bubbles:true,cancelable:true});document.activeElement.dispatchEvent(e);return e.defaultPrevented})()`),false);
+  await call('Input.insertText',{text:' hello world'});assert.ok(await ev('document.querySelector("#annotation-label").value.includes("hello world")'));await until(paused);report.textInputKeepsSpaces=true;
+  const screenshot=await call('Page.captureScreenshot',{format:'png'});await writeFile(new URL('playback-controls-browser.png',root),Buffer.from(screenshot.data,'base64'));
+  assert.equal(errors.length,0);report.errors=errors;console.log(JSON.stringify(report,null,2));
+ } else if(process.argv.includes('--annotations')) {
   await open('vfr');
   const save=async()=>{await ev('(document.activeElement.blur(),__audit.saved=null)');await key('s','KeyS',2);await until('__audit.saved!==null');return ev('__audit.saved');};
   const mouse=(type,x,y)=>call('Input.dispatchMouseEvent',{type,x,y,button:type==='mouseMoved'?'none':'left',buttons:type==='mouseReleased'?0:1,clickCount:1});
@@ -202,4 +235,4 @@ try{
  await click('Next frame');await expectFrame(times[1]);assert.equal(await ev('__audit.calls.filter(c=>c.cmd==="get_frame_step").at(-1).args.inputPath'),fixtures.find(f=>f.name==='proxy').path);report.proxyUsesActualFrames=true;
  assert.equal(errors.length,0);report.errors=errors;console.log(JSON.stringify(report,null,2));
  }
-}finally{await writeFile(new URL(process.argv.includes('--annotations')?'annotations-browser-results.json':process.argv.includes('--export-progress')?'export-progress-results.json':process.argv.includes('--timeline')?'timeline-browser-results.json':'frame-browser-results.json',root),JSON.stringify(report,null,2));await send('Target.closeTarget',{targetId});ws.close();server.stop(true);}
+}finally{await writeFile(new URL(process.argv.includes('--playback-controls')?'playback-controls-results.json':process.argv.includes('--annotations')?'annotations-browser-results.json':process.argv.includes('--export-progress')?'export-progress-results.json':process.argv.includes('--timeline')?'timeline-browser-results.json':'frame-browser-results.json',root),JSON.stringify(report,null,2));await send('Target.closeTarget',{targetId});ws.close();server.stop(true);}
